@@ -55,7 +55,7 @@ export async function GET(
       recordingId: id,
       query,
       resultCount: matchingUtterances.length,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(),
     });
 
     // Format results with highlighted matches

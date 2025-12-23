@@ -1,7 +1,7 @@
 'use client';
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useState, useRef, useEffect, use, useCallback } from 'react';
+import { useState, useRef, useEffect, use, useCallback, useMemo } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -39,6 +39,11 @@ import {
   Edit,
   FileDown,
   X,
+  UserPlus,
+  Users,
+  MoreVertical,
+  Undo2,
+  Trash2,
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -84,7 +89,33 @@ interface SearchResult {
   text: string;
   startMs: number;
   endMs: number;
+  sequenceIndex: number;
   highlights: Array<{ start: number; end: number }>;
+}
+
+// Text segment with speaker attribution (for partial text changes)
+interface TextSegment {
+  text: string;
+  speaker: string;
+  speakerLabel: string | null;
+  startCharIndex: number;
+  endCharIndex: number;
+}
+
+// Edit that tracks text splits within an utterance
+interface UtteranceEdit {
+  utteranceId: string;
+  segments: TextSegment[];
+  deletedSegmentIndices?: number[]; // Track which segments have been deleted
+}
+
+// Selection state for text highlighting
+interface TextSelection {
+  utteranceId: string;
+  selectedText: string;
+  startOffset: number;
+  endOffset: number;
+  position: { x: number; y: number };
 }
 
 async function fetchRecording(id: string): Promise<RecordingData> {
@@ -128,7 +159,7 @@ function formatTimestamp(ms: number): string {
 }
 
 function formatDuration(seconds: number | null | undefined): string {
-  if (seconds === null || seconds === undefined || seconds === 0) return '—';
+  if (seconds === null || seconds === undefined || seconds <= 0) return '—';
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const secs = Math.floor(seconds % 60);
@@ -148,82 +179,6 @@ const SPEAKER_COLORS = [
   'bg-pink-100 text-pink-800 dark:bg-pink-900 dark:text-pink-200',
   'bg-cyan-100 text-cyan-800 dark:bg-cyan-900 dark:text-cyan-200',
 ];
-
-// Word-level highlighting component
-function WordHighlightedText({ 
-  text, 
-  utteranceStartMs, 
-  utteranceEndMs, 
-  currentTimeMs, 
-  isActive,
-  searchHighlights,
-}: { 
-  text: string; 
-  utteranceStartMs: number;
-  utteranceEndMs: number;
-  currentTimeMs: number;
-  isActive: boolean;
-  searchHighlights?: Array<{ start: number; end: number }>;
-}) {
-  const words = text.split(/(\s+)/);
-  const utteranceDuration = utteranceEndMs - utteranceStartMs;
-  const totalChars = text.length;
-  
-  // Calculate progress through the utterance
-  const progress = isActive 
-    ? Math.min(1, Math.max(0, (currentTimeMs - utteranceStartMs) / utteranceDuration))
-    : 0;
-  
-  // Estimate which character we're at based on progress
-  const currentCharIndex = Math.floor(progress * totalChars);
-  
-  let charCount = 0;
-  
-  return (
-    <>
-      {words.map((word, index) => {
-        const wordStart = charCount;
-        const wordEnd = charCount + word.length;
-        charCount = wordEnd;
-        
-        // Check if this word is currently being spoken
-        const isCurrentWord = isActive && wordStart <= currentCharIndex && currentCharIndex < wordEnd;
-        
-        // Check if this word is in search highlights
-        let isSearchHighlighted = false;
-        if (searchHighlights) {
-          isSearchHighlighted = searchHighlights.some(
-            h => (wordStart >= h.start && wordStart < h.end) || 
-                 (wordEnd > h.start && wordEnd <= h.end) ||
-                 (wordStart <= h.start && wordEnd >= h.end)
-          );
-        }
-        
-        // Check if word has already been spoken
-        const hasBeenSpoken = isActive && wordEnd <= currentCharIndex;
-        
-        if (word.trim() === '') {
-          return <span key={index}>{word}</span>;
-        }
-        
-        return (
-          <span
-            key={index}
-            className={`
-              transition-all duration-100
-              ${isCurrentWord ? 'bg-yellow-300 dark:bg-yellow-600 px-0.5 rounded font-medium' : ''}
-              ${hasBeenSpoken && !isCurrentWord ? 'text-foreground' : ''}
-              ${!hasBeenSpoken && !isCurrentWord && isActive ? 'text-muted-foreground' : ''}
-              ${isSearchHighlighted ? 'bg-yellow-200 dark:bg-yellow-800 px-0.5 rounded' : ''}
-            `}
-          >
-            {word}
-          </span>
-        );
-      })}
-    </>
-  );
-}
 
 // Speaker Label Dialog
 function SpeakerLabelDialog({ 
@@ -265,7 +220,7 @@ function SpeakerLabelDialog({
         <DialogHeader>
           <DialogTitle>Edit Speaker Label</DialogTitle>
           <DialogDescription>
-            Assign a name to Speaker {speaker} (e.g., "Judge Smith", "Defense Attorney")
+            Assign a name to Speaker {speaker} (e.g., &quot;Judge Smith&quot;, &quot;Defense Attorney&quot;)
           </DialogDescription>
         </DialogHeader>
         <Input
@@ -284,37 +239,522 @@ function SpeakerLabelDialog({
   );
 }
 
+// Change Entire Segment Speaker Dialog (for header button)
+function ChangeSegmentSpeakerDialog({
+  utterance,
+  existingSpeakers,
+  speakerLabels,
+  onChangeSpeaker,
+  getSpeakerLabel,
+  speakerColorMap,
+}: {
+  utterance: Utterance;
+  existingSpeakers: string[];
+  speakerLabels: Array<{ speakerId: string; label: string }>;
+  onChangeSpeaker: (newSpeaker: string, newLabel: string | null) => void;
+  getSpeakerLabel: (speaker: string, label: string | null) => string;
+  speakerColorMap: Record<string, string>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [newSpeakerName, setNewSpeakerName] = useState('');
+  const [isCreatingNew, setIsCreatingNew] = useState(false);
+
+  const handleSelectExisting = (speaker: string) => {
+    const label = speakerLabels.find(l => l.speakerId === speaker)?.label || null;
+    onChangeSpeaker(speaker, label);
+    setOpen(false);
+    toast.success('Segment speaker changed');
+  };
+
+  const handleCreateNew = () => {
+    if (!newSpeakerName.trim()) {
+      toast.error('Please enter a speaker name');
+      return;
+    }
+    const newSpeakerId = `new_${Date.now()}`;
+    onChangeSpeaker(newSpeakerId, newSpeakerName.trim());
+    setOpen(false);
+    setNewSpeakerName('');
+    setIsCreatingNew(false);
+    toast.success('Segment assigned to new speaker');
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="sm" className="h-6 px-1" title="Change entire segment speaker">
+          <Users className="h-3 w-3" />
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Change Segment Speaker</DialogTitle>
+          <DialogDescription>
+            Reassign this entire segment to a different speaker.
+          </DialogDescription>
+        </DialogHeader>
+        
+        <div className="space-y-4">
+          {/* Current speaker */}
+          <div className="p-3 bg-muted rounded-lg">
+            <p className="text-sm text-muted-foreground mb-1">Current speaker:</p>
+            <Badge className={speakerColorMap[utterance.speaker] || SPEAKER_COLORS[0]}>
+              <User className="h-3 w-3 mr-1" />
+              {getSpeakerLabel(utterance.speaker, utterance.speakerLabel)}
+            </Badge>
+          </div>
+
+          {/* Existing speakers */}
+          {!isCreatingNew && (
+            <div>
+              <p className="text-sm font-medium mb-2">Select speaker:</p>
+              <div className="flex flex-wrap gap-2">
+                {existingSpeakers
+                  .filter(s => s !== utterance.speaker)
+                  .map(speaker => (
+                    <Button
+                      key={speaker}
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleSelectExisting(speaker)}
+                      className="gap-1"
+                    >
+                      <Badge variant="secondary" className={speakerColorMap[speaker] || SPEAKER_COLORS[0]}>
+                        <User className="h-3 w-3 mr-1" />
+                        {getSpeakerLabel(speaker, speakerLabels.find(l => l.speakerId === speaker)?.label || null)}
+                      </Badge>
+                    </Button>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {/* Create new speaker */}
+          <div className="border-t pt-4">
+            {!isCreatingNew ? (
+              <Button
+                variant="outline"
+                onClick={() => setIsCreatingNew(true)}
+                className="w-full gap-2"
+              >
+                <UserPlus className="h-4 w-4" />
+                Create New Speaker
+              </Button>
+            ) : (
+              <div className="space-y-2">
+                <Input
+                  value={newSpeakerName}
+                  onChange={(e) => setNewSpeakerName(e.target.value)}
+                  placeholder="Enter new speaker name..."
+                  autoFocus
+                />
+                <div className="flex gap-2">
+                  <Button variant="outline" onClick={() => setIsCreatingNew(false)} className="flex-1">
+                    Cancel
+                  </Button>
+                  <Button onClick={handleCreateNew} className="flex-1">
+                    Create & Assign
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setOpen(false)}>
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// Floating Selection Popover for changing speaker attribution of highlighted text
+function SelectionPopover({
+  selection,
+  existingSpeakers,
+  speakerLabels,
+  onChangeSpeaker,
+  onClose,
+  getSpeakerLabel,
+  speakerColorMap,
+  currentSpeaker,
+}: {
+  selection: TextSelection;
+  existingSpeakers: string[];
+  speakerLabels: Array<{ speakerId: string; label: string }>;
+  onChangeSpeaker: (newSpeaker: string, newLabel: string | null) => void;
+  onClose: () => void;
+  getSpeakerLabel: (speaker: string, label: string | null) => string;
+  speakerColorMap: Record<string, string>;
+  currentSpeaker: string;
+}) {
+  const [isCreatingNew, setIsCreatingNew] = useState(false);
+  const [newSpeakerName, setNewSpeakerName] = useState('');
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  // Close on click outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+        onClose();
+      }
+    };
+    
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
+
+  const handleSelectExisting = (speaker: string) => {
+    const label = speakerLabels.find(l => l.speakerId === speaker)?.label || null;
+    onChangeSpeaker(speaker, label);
+    onClose();
+    toast.success('Speaker attribution changed for selected text');
+  };
+
+  const handleCreateNew = () => {
+    if (!newSpeakerName.trim()) {
+      toast.error('Please enter a speaker name');
+      return;
+    }
+    const newSpeakerId = `new_${Date.now()}`;
+    onChangeSpeaker(newSpeakerId, newSpeakerName.trim());
+    onClose();
+    toast.success('Selected text assigned to new speaker');
+  };
+
+  // Calculate position - ensure it stays within viewport
+  const style: React.CSSProperties = {
+    position: 'fixed',
+    left: Math.min(Math.max(10, selection.position.x), window.innerWidth - 320),
+    top: Math.min(selection.position.y + 10, window.innerHeight - 300),
+    zIndex: 100,
+  };
+
+  return (
+    <div
+      ref={popoverRef}
+      style={style}
+      className="bg-background border rounded-lg shadow-xl p-3 w-[300px] animate-in fade-in-0 zoom-in-95"
+    >
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <Users className="h-4 w-4 text-primary" />
+          <span className="text-sm font-medium">Change Speaker</span>
+        </div>
+        <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onClose}>
+          <X className="h-3 w-3" />
+        </Button>
+      </div>
+
+      {/* Selected text preview */}
+      <div className="bg-muted/50 rounded p-2 mb-3 text-xs text-muted-foreground max-h-16 overflow-hidden">
+        &quot;{selection.selectedText.length > 80 
+          ? selection.selectedText.substring(0, 80) + '...' 
+          : selection.selectedText}&quot;
+      </div>
+
+      {!isCreatingNew ? (
+        <>
+          {/* Existing speakers */}
+          <div className="space-y-1 mb-3">
+            <p className="text-xs text-muted-foreground mb-1">Assign selected text to:</p>
+            <div className="flex flex-wrap gap-1">
+              {existingSpeakers.map(speaker => (
+                <Button
+                  key={speaker}
+                  variant={speaker === currentSpeaker ? "secondary" : "outline"}
+                  size="sm"
+                  onClick={() => handleSelectExisting(speaker)}
+                  className="h-7 text-xs gap-1"
+                  disabled={speaker === currentSpeaker}
+                >
+                  <div className={`w-2 h-2 rounded-full ${speakerColorMap[speaker]?.split(' ')[0] || 'bg-gray-400'}`} />
+                  {getSpeakerLabel(speaker, speakerLabels.find(l => l.speakerId === speaker)?.label || null)}
+                </Button>
+              ))}
+            </div>
+          </div>
+
+          {/* Create new speaker button */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setIsCreatingNew(true)}
+            className="w-full h-7 text-xs gap-1"
+          >
+            <UserPlus className="h-3 w-3" />
+            New Speaker
+          </Button>
+        </>
+      ) : (
+        <div className="space-y-2">
+          <Input
+            value={newSpeakerName}
+            onChange={(e) => setNewSpeakerName(e.target.value)}
+            placeholder="Enter speaker name..."
+            className="h-8 text-sm"
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                handleCreateNew();
+              }
+            }}
+          />
+          <div className="flex gap-1">
+            <Button 
+              variant="outline" 
+              size="sm" 
+              onClick={() => setIsCreatingNew(false)}
+              className="flex-1 h-7 text-xs"
+            >
+              Cancel
+            </Button>
+            <Button 
+              size="sm" 
+              onClick={handleCreateNew}
+              className="flex-1 h-7 text-xs"
+            >
+              Create
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Segmented text display component - shows text with different speaker attributions
+function SegmentedText({
+  segments,
+  utteranceStartMs,
+  utteranceEndMs,
+  currentTimeMs,
+  isActive,
+  searchHighlights,
+  speakerColorMap,
+  getSpeakerLabel,
+}: {
+  segments: TextSegment[];
+  utteranceStartMs: number;
+  utteranceEndMs: number;
+  currentTimeMs: number;
+  isActive: boolean;
+  searchHighlights?: Array<{ start: number; end: number }>;
+  speakerColorMap: Record<string, string>;
+  getSpeakerLabel: (speaker: string, label: string | null) => string;
+}) {
+  const utteranceDuration = utteranceEndMs - utteranceStartMs;
+  const totalChars = segments.reduce((sum, s) => sum + s.text.length, 0);
+  
+  const progress = isActive 
+    ? Math.min(1, Math.max(0, (currentTimeMs - utteranceStartMs) / utteranceDuration))
+    : 0;
+  
+  const currentCharIndex = Math.floor(progress * totalChars);
+  
+  return (
+    <>
+      {segments.map((segment, segIndex) => {
+        const isFirstSegment = segIndex === 0;
+        const segmentColor = speakerColorMap[segment.speaker]?.split(' ')[0] || 'bg-gray-200';
+        
+        // Split segment text into words for highlighting
+        const words = segment.text.split(/(\s+)/);
+        let charCount = segment.startCharIndex;
+        
+        return (
+          <span key={segIndex} className="relative">
+            {/* Show speaker badge for non-first segments */}
+            {!isFirstSegment && (
+              <Badge 
+                variant="outline" 
+                className={`inline-flex items-center mx-1 text-[10px] py-0 px-1 ${segmentColor} border-0`}
+              >
+                {getSpeakerLabel(segment.speaker, segment.speakerLabel)}
+              </Badge>
+            )}
+            {words.map((word, wordIndex) => {
+              const wordStart = charCount;
+              const wordEnd = charCount + word.length;
+              charCount = wordEnd;
+              
+              const isCurrentWord = isActive && wordStart <= currentCharIndex && currentCharIndex < wordEnd;
+              const hasBeenSpoken = isActive && wordEnd <= currentCharIndex;
+              
+              let isSearchHighlighted = false;
+              if (searchHighlights) {
+                isSearchHighlighted = searchHighlights.some(
+                  h => (wordStart >= h.start && wordStart < h.end) || 
+                       (wordEnd > h.start && wordEnd <= h.end) ||
+                       (wordStart <= h.start && wordEnd >= h.end)
+                );
+              }
+              
+              if (word.trim() === '') {
+                return <span key={wordIndex}>{word}</span>;
+              }
+              
+              return (
+                <span
+                  key={wordIndex}
+                  className={`
+                    transition-all duration-100
+                    ${!isFirstSegment ? `border-b-2 ${segmentColor.replace('bg-', 'border-')}` : ''}
+                    ${isCurrentWord ? 'bg-yellow-300 dark:bg-yellow-600 px-0.5 rounded font-medium' : ''}
+                    ${hasBeenSpoken && !isCurrentWord ? 'text-foreground' : ''}
+                    ${!hasBeenSpoken && !isCurrentWord && isActive ? 'text-muted-foreground' : ''}
+                    ${isSearchHighlighted ? 'bg-yellow-200 dark:bg-yellow-800 px-0.5 rounded' : ''}
+                  `}
+                >
+                  {word}
+                </span>
+              );
+            })}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
 // PDF Preview Dialog
 function PDFExportDialog({ 
   recording, 
   utterances,
+  utteranceEdits,
   getSpeakerLabel,
 }: { 
   recording: Recording;
   utterances: Utterance[];
+  utteranceEdits: UtteranceEdit[];
   getSpeakerLabel: (speaker: string, label: string | null) => string;
 }) {
   const [open, setOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
 
-  const generatePDFContent = () => {
-    // Generate transcript content for preview
-    let content = `TRANSCRIPT\n\n`;
-    content += `File: ${recording.filename}\n`;
-    if (recording.caseNumber) content += `Case Number: ${recording.caseNumber}\n`;
-    if (recording.courtName) content += `Court: ${recording.courtName}\n`;
-    if (recording.recordingDate) content += `Date: ${recording.recordingDate}\n`;
-    content += `Duration: ${formatDuration(recording.durationSeconds)}\n`;
-    content += `\n${'─'.repeat(50)}\n\n`;
+  // Process utterances with edits and merge adjacent same-speaker segments
+  const processedSegments = useMemo(() => {
+    const allSegments: Array<{
+      speaker: string;
+      speakerLabel: string | null;
+      text: string;
+      startMs: number;
+      endMs: number;
+    }> = [];
 
-    utterances.forEach((u) => {
-      const speaker = getSpeakerLabel(u.speaker, u.speakerLabel);
-      const timestamp = formatTimestamp(u.startMs);
-      content += `[${timestamp}] ${speaker}:\n${u.text}\n\n`;
+    for (const utterance of utterances) {
+      const edit = utteranceEdits.find(e => e.utteranceId === utterance.id);
+      
+      if (edit && edit.segments.length > 0) {
+        // Use edited segments
+        for (const segment of edit.segments) {
+          allSegments.push({
+            speaker: segment.speaker,
+            speakerLabel: segment.speakerLabel,
+            text: segment.text,
+            startMs: utterance.startMs,
+            endMs: utterance.endMs,
+          });
+        }
+      } else {
+        // Use original utterance
+        allSegments.push({
+          speaker: utterance.speaker,
+          speakerLabel: utterance.speakerLabel,
+          text: utterance.text,
+          startMs: utterance.startMs,
+          endMs: utterance.endMs,
+        });
+      }
+    }
+
+    // Merge adjacent segments with same speaker
+    const merged: typeof allSegments = [];
+    for (const segment of allSegments) {
+      const last = merged[merged.length - 1];
+      if (last && last.speaker === segment.speaker) {
+        merged[merged.length - 1] = {
+          ...last,
+          text: last.text + ' ' + segment.text,
+          endMs: segment.endMs,
+        };
+      } else {
+        merged.push({ ...segment });
+      }
+    }
+    
+    return merged;
+  }, [utterances, utteranceEdits]);
+
+  const generatePDFContent = () => {
+    const width = 60;
+    let content = '';
+    
+    // Case.dev watermark header
+    content += `◆ Transcription generated through case.dev\n\n`;
+    content += `${'═'.repeat(width)}\n\n`;
+    
+    // Title
+    const title = 'OFFICIAL TRANSCRIPT';
+    const subtitle = 'Court Recording Transcription';
+    content += `${' '.repeat(Math.floor((width - title.length) / 2))}${title}\n`;
+    content += `${' '.repeat(Math.floor((width - subtitle.length) / 2))}${subtitle}\n\n`;
+    content += `${'═'.repeat(width)}\n`;
+    content += `${'─'.repeat(width)}\n\n`;
+    
+    // Recording Information
+    content += `RECORDING INFORMATION\n`;
+    content += `${'─'.repeat(30)}\n\n`;
+    content += `  File:          ${recording.filename}\n`;
+    if (recording.caseNumber) content += `  Case Number:   ${recording.caseNumber}\n`;
+    if (recording.courtName) content += `  Court:         ${recording.courtName}\n`;
+    if (recording.recordingDate) content += `  Date:          ${recording.recordingDate}\n`;
+    content += `  Duration:      ${formatDuration(recording.durationSeconds)}\n`;
+    content += `\n${'─'.repeat(width)}\n\n`;
+    
+    // Transcript heading
+    content += `TRANSCRIPT OF PROCEEDINGS\n`;
+    content += `${'─'.repeat(30)}\n\n`;
+
+    // Utterances with line numbers
+    let lineNumber = 1;
+    processedSegments.forEach((segment) => {
+      const speaker = getSpeakerLabel(segment.speaker, segment.speakerLabel);
+      const timestamp = formatTimestamp(segment.startMs);
+      const lineNum = lineNumber.toString().padStart(3, ' ');
+      content += `${lineNum}  [${timestamp}] ${speaker.toUpperCase()}:\n`;
+      content += `      ${segment.text}\n\n`;
+      lineNumber++;
     });
+
+    // End of transcript
+    content += `${'─'.repeat(width)}\n\n`;
+    const endText = 'END OF TRANSCRIPT';
+    content += `${' '.repeat(Math.floor((width - endText.length) / 2))}${endText}\n\n`;
+    content += `${'─'.repeat(width)}\n\n`;
+    
+    // Footer
+    content += `This transcript was generated using automated speech recognition technology.\n`;
+    content += `Document generated on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}\n\n`;
+    content += `${'═'.repeat(width)}\n`;
 
     return content;
   };
+
+  const editCount = utteranceEdits.length;
 
   const handleExportPDF = async () => {
     setIsExporting(true);
@@ -354,6 +794,11 @@ function PDFExportDialog({
           <DialogTitle>PDF Export Preview</DialogTitle>
           <DialogDescription>
             Preview your transcript before exporting
+            {editCount > 0 && (
+              <span className="ml-2 text-primary">
+                ({editCount} segment{editCount !== 1 ? 's' : ''} edited)
+              </span>
+            )}
           </DialogDescription>
         </DialogHeader>
         <div className="border rounded-lg bg-white dark:bg-gray-900 p-6 max-h-[50vh] overflow-auto">
@@ -376,18 +821,107 @@ function PDFExportDialog({
   );
 }
 
+// Floating Playback Bar Component
+function FloatingPlaybackBar({
+  isPlaying,
+  currentTimeMs,
+  durationMs,
+  onTogglePlayPause,
+  onSkip,
+  onSeek,
+  hasAudio,
+}: {
+  isPlaying: boolean;
+  currentTimeMs: number;
+  durationMs: number;
+  onTogglePlayPause: () => void;
+  onSkip: (seconds: number) => void;
+  onSeek: (ms: number) => void;
+  hasAudio: boolean;
+}) {
+  if (!hasAudio) return null;
+
+  const progress = durationMs > 0 ? (currentTimeMs / durationMs) * 100 : 0;
+
+  return (
+    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50">
+      <div className="bg-background/95 backdrop-blur-sm border rounded-full shadow-lg px-4 py-2 flex items-center gap-3">
+        <Button 
+          variant="ghost" 
+          size="icon" 
+          className="h-8 w-8 rounded-full"
+          onClick={() => onSkip(-10)}
+          title="Skip back 10 seconds"
+        >
+          <SkipBack className="h-4 w-4" />
+        </Button>
+
+        <Button 
+          size="icon" 
+          className="h-10 w-10 rounded-full"
+          onClick={onTogglePlayPause}
+        >
+          {isPlaying ? (
+            <Pause className="h-5 w-5" />
+          ) : (
+            <Play className="h-5 w-5 ml-0.5" />
+          )}
+        </Button>
+
+        <Button 
+          variant="ghost" 
+          size="icon" 
+          className="h-8 w-8 rounded-full"
+          onClick={() => onSkip(10)}
+          title="Skip forward 10 seconds"
+        >
+          <SkipForward className="h-4 w-4" />
+        </Button>
+
+        <div className="flex items-center gap-2 text-sm min-w-[140px]">
+          <span className="text-muted-foreground w-12 text-right">
+            {formatTimestamp(currentTimeMs)}
+          </span>
+          
+          <div 
+            className="w-24 h-1.5 bg-muted rounded-full cursor-pointer overflow-hidden"
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const percent = (e.clientX - rect.left) / rect.width;
+              onSeek(percent * durationMs);
+            }}
+          >
+            <div 
+              className="h-full bg-black transition-all"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+          
+          <span className="text-muted-foreground w-12">
+            {formatTimestamp(durationMs)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function RecordingPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
+  const [audioDurationMs, setAudioDurationMs] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
   const [isSearching, setIsSearching] = useState(false);
-  const [autoScroll, setAutoScroll] = useState(true);
+  const [autoScroll, setAutoScroll] = useState(false);
   const [userScrolledRecently, setUserScrolledRecently] = useState(false);
+  const [utteranceEdits, setUtteranceEdits] = useState<UtteranceEdit[]>([]);
+  const [textSelection, setTextSelection] = useState<TextSelection | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const activeUtteranceRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
   const userScrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastAutoScrollTimeRef = useRef<number>(0);
 
@@ -396,31 +930,87 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
     queryFn: () => fetchRecording(id),
   });
 
+  // Handle text selection in transcript
+  useEffect(() => {
+    const handleMouseUp = (e: MouseEvent) => {
+      if (!transcriptRef.current?.contains(e.target as Node)) {
+        return;
+      }
+
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.toString().trim()) {
+        return;
+      }
+
+      const selectedText = selection.toString().trim();
+      if (selectedText.length < 3) return;
+
+      const range = selection.getRangeAt(0);
+      const container = range.commonAncestorContainer;
+      
+      // Walk up to find the utterance element
+      let utteranceElement: HTMLElement | null = null;
+      let current: Node | null = container;
+      while (current && current !== transcriptRef.current) {
+        if (current instanceof HTMLElement && current.id?.startsWith('utterance-')) {
+          utteranceElement = current;
+          break;
+        }
+        current = current.parentNode;
+      }
+
+      if (utteranceElement) {
+        const utteranceId = utteranceElement.id.replace('utterance-', '');
+        const rect = range.getBoundingClientRect();
+        
+        // Find the text content element and calculate offsets
+        const textElement = utteranceElement.querySelector('[data-text-content]');
+        if (textElement) {
+          // Get the full text and find where the selection starts/ends
+          const fullText = textElement.textContent || '';
+          const startOffset = fullText.indexOf(selectedText);
+          const endOffset = startOffset + selectedText.length;
+          
+          if (startOffset >= 0) {
+            setTextSelection({
+              utteranceId,
+              selectedText,
+              startOffset,
+              endOffset,
+              position: {
+                x: rect.left + rect.width / 2 - 150,
+                y: rect.bottom,
+              },
+            });
+          }
+        }
+      }
+    };
+
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => document.removeEventListener('mouseup', handleMouseUp);
+  }, []);
+
   // Detect user scroll and temporarily disable auto-scroll
   useEffect(() => {
     const scrollArea = scrollAreaRef.current;
     if (!scrollArea) return;
 
-    // Find the actual scrollable viewport inside ScrollArea
     const viewport = scrollArea.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement;
     if (!viewport) return;
 
     const handleUserScroll = () => {
-      // Ignore if this scroll was triggered by auto-scroll (within 100ms)
       const now = Date.now();
       if (now - lastAutoScrollTimeRef.current < 150) return;
 
-      // User is scrolling - disable auto-scroll
       if (autoScroll && isPlaying) {
         setAutoScroll(false);
         setUserScrolledRecently(true);
         
-        // Clear any existing timeout
         if (userScrollTimeoutRef.current) {
           clearTimeout(userScrollTimeoutRef.current);
         }
         
-        // Re-enable auto-scroll after 5 seconds of no user scrolling
         userScrollTimeoutRef.current = setTimeout(() => {
           setUserScrolledRecently(false);
         }, 5000);
@@ -437,7 +1027,7 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
     };
   }, [autoScroll, isPlaying]);
 
-  // Auto-scroll to active utterance with word-level precision
+  // Auto-scroll to active utterance
   useEffect(() => {
     if (activeUtteranceRef.current && isPlaying && autoScroll && !userScrolledRecently) {
       lastAutoScrollTimeRef.current = Date.now();
@@ -448,7 +1038,27 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
     }
   }, [currentTimeMs, isPlaying, autoScroll, userScrolledRecently]);
 
-  // Audio time update handler - use requestAnimationFrame for smoother word highlighting
+  // ESC key handler
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (textSelection) {
+          setTextSelection(null);
+        } else if (autoScroll) {
+          setAutoScroll(false);
+        }
+      }
+      if (e.key === ' ' && e.target === document.body) {
+        e.preventDefault();
+        togglePlayPause();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [autoScroll, textSelection]);
+
+  // Audio time update handler and duration detection
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -464,6 +1074,20 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
       isUpdating = audio && !audio.paused;
     };
 
+    const handleLoadedMetadata = () => {
+      // Get duration from audio element when metadata loads
+      if (audio.duration && !isNaN(audio.duration) && isFinite(audio.duration)) {
+        setAudioDurationMs(audio.duration * 1000);
+      }
+    };
+
+    const handleDurationChange = () => {
+      // Also listen for duration changes
+      if (audio.duration && !isNaN(audio.duration) && isFinite(audio.duration)) {
+        setAudioDurationMs(audio.duration * 1000);
+      }
+    };
+
     const handlePlay = () => {
       setIsPlaying(true);
       if (!isUpdating) {
@@ -473,64 +1097,60 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
     
     const handlePause = () => {
       setIsPlaying(false);
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
     };
     
     const handleEnded = () => {
       setIsPlaying(false);
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
     };
 
     const handleTimeUpdate = () => {
-      // Fallback for when RAF isn't running
-      if (!isUpdating) {
-        setCurrentTimeMs(audio.currentTime * 1000);
-      }
+      if (!isUpdating) setCurrentTimeMs(audio.currentTime * 1000);
     };
 
+    // Check if duration is already available
+    if (audio.duration && !isNaN(audio.duration) && isFinite(audio.duration)) {
+      setAudioDurationMs(audio.duration * 1000);
+    }
+
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata);
+    audio.addEventListener('durationchange', handleDurationChange);
     audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('play', handlePlay);
     audio.addEventListener('pause', handlePause);
     audio.addEventListener('ended', handleEnded);
 
     return () => {
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      audio.removeEventListener('durationchange', handleDurationChange);
       audio.removeEventListener('timeupdate', handleTimeUpdate);
       audio.removeEventListener('play', handlePlay);
       audio.removeEventListener('pause', handlePause);
       audio.removeEventListener('ended', handleEnded);
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
     };
   }, [data?.recording.convertedAudioUrl]);
 
-  const togglePlayPause = () => {
+  const togglePlayPause = useCallback(() => {
     const audio = audioRef.current;
     if (!audio) return;
+    if (isPlaying) audio.pause();
+    else audio.play();
+  }, [isPlaying]);
 
-    if (isPlaying) {
-      audio.pause();
-    } else {
-      audio.play();
-    }
-  };
-
-  const seekTo = (ms: number) => {
+  const seekTo = useCallback((ms: number) => {
     const audio = audioRef.current;
     if (!audio) return;
     audio.currentTime = ms / 1000;
     setCurrentTimeMs(ms);
-  };
+  }, []);
 
-  const skip = (seconds: number) => {
+  const skip = useCallback((seconds: number) => {
     const audio = audioRef.current;
     if (!audio) return;
     audio.currentTime = Math.max(0, audio.currentTime + seconds);
-  };
+  }, []);
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) {
@@ -542,9 +1162,7 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
     try {
       const results = await searchTranscript(id, searchQuery);
       setSearchResults(results.results);
-      if (results.results.length === 0) {
-        toast.info('No results found');
-      }
+      if (results.results.length === 0) toast.info('No results found');
     } catch (error) {
       toast.error('Search failed');
     } finally {
@@ -573,21 +1191,211 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
     }
   };
 
-  // Create speaker color map
-  const speakerColorMap: Record<string, string> = {};
-  if (data?.utterances) {
-    const uniqueSpeakers = [...new Set(data.utterances.map(u => u.speaker))];
-    uniqueSpeakers.forEach((speaker, index) => {
-      speakerColorMap[speaker] = SPEAKER_COLORS[index % SPEAKER_COLORS.length];
+  // Handle partial text speaker change (from selection)
+  const handlePartialSpeakerChange = useCallback((
+    utteranceId: string,
+    startOffset: number,
+    endOffset: number,
+    newSpeaker: string,
+    newLabel: string | null
+  ) => {
+    if (!data) return;
+    
+    const utterance = data.utterances.find(u => u.id === utteranceId);
+    if (!utterance) return;
+
+    setUtteranceEdits(prev => {
+      const existingEdit = prev.find(e => e.utteranceId === utteranceId);
+      const currentSegments = existingEdit?.segments || [{
+        text: utterance.text,
+        speaker: utterance.speaker,
+        speakerLabel: utterance.speakerLabel,
+        startCharIndex: 0,
+        endCharIndex: utterance.text.length,
+      }];
+
+      // Split segments based on the new selection
+      const newSegments: TextSegment[] = [];
+      let charIndex = 0;
+
+      for (const segment of currentSegments) {
+        const segmentStart = charIndex;
+        const segmentEnd = charIndex + segment.text.length;
+        
+        // Check if selection overlaps with this segment
+        const overlapStart = Math.max(startOffset, segmentStart);
+        const overlapEnd = Math.min(endOffset, segmentEnd);
+        
+        if (overlapStart < overlapEnd) {
+          // Selection overlaps with this segment - split it
+          
+          // Part before selection (if any)
+          if (overlapStart > segmentStart) {
+            const beforeText = segment.text.substring(0, overlapStart - segmentStart);
+            newSegments.push({
+              text: beforeText,
+              speaker: segment.speaker,
+              speakerLabel: segment.speakerLabel,
+              startCharIndex: segmentStart,
+              endCharIndex: overlapStart,
+            });
+          }
+          
+          // The selected part with new speaker
+          const selectedText = segment.text.substring(overlapStart - segmentStart, overlapEnd - segmentStart);
+          newSegments.push({
+            text: selectedText,
+            speaker: newSpeaker,
+            speakerLabel: newLabel,
+            startCharIndex: overlapStart,
+            endCharIndex: overlapEnd,
+          });
+          
+          // Part after selection (if any)
+          if (overlapEnd < segmentEnd) {
+            const afterText = segment.text.substring(overlapEnd - segmentStart);
+            newSegments.push({
+              text: afterText,
+              speaker: segment.speaker,
+              speakerLabel: segment.speakerLabel,
+              startCharIndex: overlapEnd,
+              endCharIndex: segmentEnd,
+            });
+          }
+        } else {
+          // No overlap - keep segment as is
+          newSegments.push({
+            ...segment,
+            startCharIndex: segmentStart,
+            endCharIndex: segmentEnd,
+          });
+        }
+        
+        charIndex = segmentEnd;
+      }
+
+      // Merge adjacent segments with same speaker
+      const mergedSegments: TextSegment[] = [];
+      for (const segment of newSegments) {
+        const last = mergedSegments[mergedSegments.length - 1];
+        if (last && last.speaker === segment.speaker) {
+          mergedSegments[mergedSegments.length - 1] = {
+            ...last,
+            text: last.text + segment.text,
+            endCharIndex: segment.endCharIndex,
+          };
+        } else {
+          mergedSegments.push(segment);
+        }
+      }
+
+      // Update or add the edit
+      const filtered = prev.filter(e => e.utteranceId !== utteranceId);
+      
+      // Only add edit if segments differ from original
+      const isModified = mergedSegments.length > 1 || 
+        mergedSegments[0]?.speaker !== utterance.speaker;
+      
+      if (isModified) {
+        return [...filtered, { utteranceId, segments: mergedSegments }];
+      }
+      return filtered;
     });
-  }
+  }, [data]);
+
+  // Handle entire segment speaker change (from header button)
+  const handleEntireSegmentSpeakerChange = useCallback((
+    utteranceId: string,
+    newSpeaker: string,
+    newLabel: string | null
+  ) => {
+    if (!data) return;
+    
+    const utterance = data.utterances.find(u => u.id === utteranceId);
+    if (!utterance) return;
+
+    setUtteranceEdits(prev => {
+      const filtered = prev.filter(e => e.utteranceId !== utteranceId);
+      
+      // If changing back to original speaker, just remove the edit
+      if (newSpeaker === utterance.speaker) {
+        return filtered;
+      }
+      
+      // Replace entire segment with new speaker
+      return [...filtered, {
+        utteranceId,
+        segments: [{
+          text: utterance.text,
+          speaker: newSpeaker,
+          speakerLabel: newLabel,
+          startCharIndex: 0,
+          endCharIndex: utterance.text.length,
+        }],
+      }];
+    });
+  }, [data]);
+
+  // Get segments for an utterance (considering edits)
+  const getUtteranceSegments = useCallback((utterance: Utterance): TextSegment[] => {
+    const edit = utteranceEdits.find(e => e.utteranceId === utterance.id);
+    if (edit) return edit.segments;
+    
+    return [{
+      text: utterance.text,
+      speaker: utterance.speaker,
+      speakerLabel: utterance.speakerLabel,
+      startCharIndex: 0,
+      endCharIndex: utterance.text.length,
+    }];
+  }, [utteranceEdits]);
+
+  // Get unique speakers including any new ones from edits
+  const allSpeakers = useMemo(() => {
+    const speakers = new Set<string>();
+    data?.utterances.forEach(u => speakers.add(u.speaker));
+    utteranceEdits.forEach(e => e.segments.forEach(s => speakers.add(s.speaker)));
+    return Array.from(speakers);
+  }, [data?.utterances, utteranceEdits]);
+
+  // Create speaker color map
+  const speakerColorMap: Record<string, string> = useMemo(() => {
+    const map: Record<string, string> = {};
+    allSpeakers.forEach((speaker, index) => {
+      map[speaker] = SPEAKER_COLORS[index % SPEAKER_COLORS.length];
+    });
+    return map;
+  }, [allSpeakers]);
 
   // Get speaker label
   const getSpeakerLabel = useCallback((speaker: string, speakerLabel: string | null) => {
+    // Check edits for new speaker labels
+    for (const edit of utteranceEdits) {
+      for (const segment of edit.segments) {
+        if (segment.speaker === speaker && segment.speakerLabel) {
+          return segment.speakerLabel;
+        }
+      }
+    }
+    
     if (speakerLabel) return speakerLabel;
     const label = data?.speakerLabels.find(l => l.speakerId === speaker);
     return label?.label || `Speaker ${speaker}`;
-  }, [data?.speakerLabels]);
+  }, [data?.speakerLabels, utteranceEdits]);
+
+  // Get primary speaker for an utterance (first segment's speaker)
+  const getPrimarySpeaker = useCallback((utterance: Utterance) => {
+    const segments = getUtteranceSegments(utterance);
+    return segments[0] || { speaker: utterance.speaker, speakerLabel: utterance.speakerLabel };
+  }, [getUtteranceSegments]);
+
+  // Get current speaker for selected utterance
+  const getSelectedUtteranceSpeaker = useCallback(() => {
+    if (!textSelection || !data) return '';
+    const utterance = data.utterances.find(u => u.id === textSelection.utteranceId);
+    if (!utterance) return '';
+    return getPrimarySpeaker(utterance).speaker;
+  }, [textSelection, data, getPrimarySpeaker]);
 
   if (isLoading) {
     return (
@@ -617,9 +1425,10 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
 
   const { recording, utterances } = data;
   const displayUtterances = searchResults || utterances;
+  const editCount = utteranceEdits.length;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 pb-24">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
@@ -633,7 +1442,7 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
             <div className="flex items-center gap-4 text-sm text-muted-foreground">
               {recording.caseNumber && <span>Case: {recording.caseNumber}</span>}
               {recording.courtName && <span>{recording.courtName}</span>}
-              {recording.durationSeconds && (
+              {recording.durationSeconds !== null && recording.durationSeconds > 0 && (
                 <span className="flex items-center gap-1">
                   <Clock className="h-4 w-4" />
                   {formatDuration(recording.durationSeconds)}
@@ -644,32 +1453,54 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
                   {(data.transcript.confidence * 100).toFixed(1)}% accuracy
                 </Badge>
               )}
+              {editCount > 0 && (
+                <Badge variant="secondary" className="gap-1">
+                  <Edit className="h-3 w-3" />
+                  {editCount} edit{editCount !== 1 ? 's' : ''}
+                </Badge>
+              )}
             </div>
           </div>
         </div>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="outline">
-              <Download className="h-4 w-4 mr-2" />
-              Export
+        <div className="flex items-center gap-2">
+          {editCount > 0 && (
+            <Button 
+              variant="outline" 
+              size="sm"
+              onClick={() => {
+                setUtteranceEdits([]);
+                toast.success('All edits cleared');
+              }}
+            >
+              <X className="h-4 w-4 mr-1" />
+              Clear Edits
             </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent>
-            <PDFExportDialog 
-              recording={recording} 
-              utterances={utterances}
-              getSpeakerLabel={getSpeakerLabel}
-            />
-            <DropdownMenuItem onClick={() => handleExport('docx')}>
-              <FileText className="h-4 w-4 mr-2" />
-              Export as Word (.docx)
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => handleExport('txt')}>
-              <FileText className="h-4 w-4 mr-2" />
-              Export as Text (.txt)
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline">
+                <Download className="h-4 w-4 mr-2" />
+                Export
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent>
+              <PDFExportDialog 
+                recording={recording} 
+                utterances={utterances}
+                utteranceEdits={utteranceEdits}
+                getSpeakerLabel={getSpeakerLabel}
+              />
+              <DropdownMenuItem onClick={() => handleExport('docx')}>
+                <FileText className="h-4 w-4 mr-2" />
+                Export as Word (.docx)
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => handleExport('txt')}>
+                <FileText className="h-4 w-4 mr-2" />
+                Export as Text (.txt)
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
@@ -690,33 +1521,30 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
                   preload="metadata"
                 />
                 
-                {/* Progress bar */}
                 <div className="space-y-2">
                   <div 
                     className="h-2 bg-muted rounded-full cursor-pointer overflow-hidden"
                     onClick={(e) => {
                       const rect = e.currentTarget.getBoundingClientRect();
                       const percent = (e.clientX - rect.left) / rect.width;
-                      const duration = recording.durationSeconds || 0;
-                      seekTo(percent * duration * 1000);
+                      seekTo(percent * audioDurationMs);
                     }}
                   >
                     <div 
-                      className="h-full bg-primary transition-all"
+                      className="h-full bg-black transition-all"
                       style={{ 
-                        width: `${recording.durationSeconds 
-                          ? (currentTimeMs / (recording.durationSeconds * 1000)) * 100 
+                        width: `${audioDurationMs > 0
+                          ? (currentTimeMs / audioDurationMs) * 100 
                           : 0}%` 
                       }}
                     />
                   </div>
                   <div className="flex justify-between text-sm text-muted-foreground">
                     <span>{formatTimestamp(currentTimeMs)}</span>
-                    <span>{formatTimestamp((recording.durationSeconds || 0) * 1000)}</span>
+                    <span>{formatTimestamp(audioDurationMs)}</span>
                   </div>
                 </div>
 
-                {/* Controls */}
                 <div className="flex items-center justify-center gap-4">
                   <Button variant="outline" size="icon" onClick={() => skip(-10)}>
                     <SkipBack className="h-4 w-4" />
@@ -733,7 +1561,6 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
                   </Button>
                 </div>
 
-                {/* Auto-scroll toggle */}
                 <div className="flex items-center justify-center gap-2 text-sm">
                   <input
                     type="checkbox"
@@ -751,7 +1578,6 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
               <div className="text-center py-8 text-muted-foreground">
                 <Volume2 className="h-12 w-12 mx-auto mb-4 opacity-50" />
                 <p>Audio not available</p>
-                <p className="text-sm">The converted audio file is not accessible</p>
               </div>
             )}
           </CardContent>
@@ -797,7 +1623,6 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
                     Clear
                   </Button>
                 </div>
-                {/* Clickable search results list */}
                 <div className="space-y-2 max-h-48 overflow-y-auto">
                   {searchResults.map((result, index) => (
                     <button
@@ -805,7 +1630,6 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
                       className="w-full text-left p-2 rounded-md hover:bg-muted/50 transition-colors border border-transparent hover:border-primary/20"
                       onClick={() => {
                         seekTo(result.startMs);
-                        // Scroll to the result in the transcript
                         const element = document.getElementById(`utterance-${result.id}`);
                         if (element) {
                           element.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -836,75 +1660,438 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
         <CardHeader>
           <CardTitle>Transcript</CardTitle>
           <CardDescription>
-            Click on any segment to jump to that point. Words highlight as they&apos;re spoken.
+            Click on any segment to jump to that point. <strong>Highlight text</strong> to change speaker for just that portion, or use the <Users className="h-3 w-3 inline" /> button to change the entire segment.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <ScrollArea className="h-[500px] pr-4" ref={scrollAreaRef}>
-            {displayUtterances.length === 0 ? (
-              <div className="text-center py-12 text-muted-foreground">
-                <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <p>No transcript available</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {displayUtterances.map((utterance) => {
-                  const isActive = currentTimeMs >= utterance.startMs && currentTimeMs < utterance.endMs;
-                  const speakerLabel = getSpeakerLabel(utterance.speaker, utterance.speakerLabel);
-                  const searchHighlights = searchResults && 'highlights' in utterance 
-                    ? (utterance as SearchResult).highlights 
-                    : undefined;
-                  
-                  return (
-                    <div
-                      key={utterance.id}
-                      id={`utterance-${utterance.id}`}
-                      ref={isActive ? activeUtteranceRef : null}
-                      className={`
-                        p-3 rounded-lg cursor-pointer transition-all
-                        ${isActive 
-                          ? 'bg-primary/10 border-l-4 border-primary shadow-sm' 
-                          : 'hover:bg-muted/50'
-                        }
-                      `}
-                      onClick={() => seekTo(utterance.startMs)}
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <Badge 
-                          variant="secondary" 
-                          className={speakerColorMap[utterance.speaker]}
+            <div ref={transcriptRef}>
+              {displayUtterances.length === 0 ? (
+                <div className="text-center py-12 text-muted-foreground">
+                  <FileText className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                  <p>No transcript available</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {displayUtterances.map((utterance) => {
+                    const isActive = currentTimeMs >= utterance.startMs && currentTimeMs < utterance.endMs;
+                    const segments = getUtteranceSegments(utterance);
+                    const hasEdit = utteranceEdits.some(e => e.utteranceId === utterance.id);
+                    const searchHighlights = searchResults && 'highlights' in utterance 
+                      ? (utterance as SearchResult).highlights 
+                      : undefined;
+                    
+                    // If there are multiple segments (edited), render each as a separate block
+                    if (segments.length > 1) {
+                      // Helper to change speaker for a specific segment
+                      const handleSegmentSpeakerChange = (segIndex: number, newSpeaker: string, newLabel: string | null) => {
+                        setUtteranceEdits(prev => {
+                          const existingEdit = prev.find(e => e.utteranceId === utterance.id);
+                          if (!existingEdit) return prev;
+                          
+                          const newSegments = [...existingEdit.segments];
+                          newSegments[segIndex] = {
+                            ...newSegments[segIndex],
+                            speaker: newSpeaker,
+                            speakerLabel: newLabel,
+                          };
+                          
+                          // Merge adjacent segments with same speaker
+                          const mergedSegments: TextSegment[] = [];
+                          for (const seg of newSegments) {
+                            const last = mergedSegments[mergedSegments.length - 1];
+                            if (last && last.speaker === seg.speaker) {
+                              mergedSegments[mergedSegments.length - 1] = {
+                                ...last,
+                                text: last.text + seg.text,
+                                endCharIndex: seg.endCharIndex,
+                              };
+                            } else {
+                              mergedSegments.push(seg);
+                            }
+                          }
+                          
+                          // Check if we're back to original
+                          if (mergedSegments.length === 1 && mergedSegments[0].speaker === utterance.speaker) {
+                            return prev.filter(e => e.utteranceId !== utterance.id);
+                          }
+                          
+                          return prev.map(e => 
+                            e.utteranceId === utterance.id 
+                              ? { ...e, segments: mergedSegments }
+                              : e
+                          );
+                        });
+                        toast.success('Segment speaker changed');
+                      };
+
+                      // Helper to delete a specific segment
+                      const handleDeleteSegment = (segIndex: number) => {
+                        setUtteranceEdits(prev => {
+                          const existingEdit = prev.find(e => e.utteranceId === utterance.id);
+                          if (!existingEdit) return prev;
+                          
+                          const newSegments = existingEdit.segments.filter((_, i) => i !== segIndex);
+                          
+                          // If no segments left, remove the edit entirely
+                          if (newSegments.length === 0) {
+                            return prev.filter(e => e.utteranceId !== utterance.id);
+                          }
+                          
+                          // Recalculate char indices
+                          let charIndex = 0;
+                          const reindexedSegments = newSegments.map(seg => {
+                            const newSeg = {
+                              ...seg,
+                              startCharIndex: charIndex,
+                              endCharIndex: charIndex + seg.text.length,
+                            };
+                            charIndex += seg.text.length;
+                            return newSeg;
+                          });
+                          
+                          return prev.map(e => 
+                            e.utteranceId === utterance.id 
+                              ? { ...e, segments: reindexedSegments }
+                              : e
+                          );
+                        });
+                        toast.success('Segment deleted');
+                      };
+
+                      // Helper to revert all edits for this utterance
+                      const handleRevertUtterance = () => {
+                        setUtteranceEdits(prev => prev.filter(e => e.utteranceId !== utterance.id));
+                        toast.success('Edits reverted');
+                      };
+
+                      return (
+                        <div key={utterance.id} id={`utterance-${utterance.id}`} className="space-y-2">
+                          {segments.map((segment, segIndex) => {
+                            const segmentSpeakerLabel = getSpeakerLabel(segment.speaker, segment.speakerLabel);
+                            // Calculate if this segment is active based on character progress
+                            const utteranceDuration = utterance.endMs - utterance.startMs;
+                            const totalChars = segments.reduce((sum, s) => sum + s.text.length, 0);
+                            const segmentStartChar = segments.slice(0, segIndex).reduce((sum, s) => sum + s.text.length, 0);
+                            const segmentEndChar = segmentStartChar + segment.text.length;
+                            const progress = isActive 
+                              ? Math.min(1, Math.max(0, (currentTimeMs - utterance.startMs) / utteranceDuration))
+                              : 0;
+                            const currentCharIndex = Math.floor(progress * totalChars);
+                            const isSegmentActive = isActive && currentCharIndex >= segmentStartChar && currentCharIndex < segmentEndChar;
+                            
+                            // Word-by-word highlighting for this segment
+                            const words = segment.text.split(/(\s+)/);
+                            let segmentCharCount = segmentStartChar;
+                            
+                            return (
+                              <div
+                                key={`${utterance.id}-seg-${segIndex}`}
+                                ref={isSegmentActive ? activeUtteranceRef : null}
+                                className={`
+                                  p-3 rounded-lg cursor-pointer transition-all select-text
+                                  ${isSegmentActive 
+                                    ? 'bg-primary/10 border-l-4 border-primary shadow-sm' 
+                                    : 'hover:bg-muted/50'
+                                  }
+                                `}
+                                onClick={(e) => {
+                                  const selection = window.getSelection();
+                                  if (!selection || selection.isCollapsed) {
+                                    seekTo(utterance.startMs);
+                                  }
+                                }}
+                              >
+                                <div className="flex items-center justify-between mb-1">
+                                  <div className="flex items-center gap-2">
+                                    <Badge 
+                                      variant="secondary" 
+                                      className={speakerColorMap[segment.speaker]}
+                                    >
+                                      <User className="h-3 w-3 mr-1" />
+                                      {segmentSpeakerLabel}
+                                    </Badge>
+                                    <SpeakerLabelDialog
+                                      speaker={segment.speaker}
+                                      currentLabel={segmentSpeakerLabel}
+                                      recordingId={id}
+                                      onUpdate={() => refetch()}
+                                    />
+                                    {/* Change speaker button for edited segments */}
+                                    <DropdownMenu>
+                                      <DropdownMenuTrigger asChild>
+                                        <Button variant="ghost" size="sm" className="h-6 px-1" title="Change segment speaker">
+                                          <Users className="h-3 w-3" />
+                                        </Button>
+                                      </DropdownMenuTrigger>
+                                      <DropdownMenuContent align="start">
+                                        {allSpeakers
+                                          .filter(s => s !== segment.speaker)
+                                          .map(speaker => (
+                                            <DropdownMenuItem
+                                              key={speaker}
+                                              onClick={() => {
+                                                const label = data.speakerLabels.find(l => l.speakerId === speaker)?.label || null;
+                                                handleSegmentSpeakerChange(segIndex, speaker, label);
+                                              }}
+                                            >
+                                              <div className={`w-2 h-2 rounded-full mr-2 ${speakerColorMap[speaker]?.split(' ')[0] || 'bg-gray-400'}`} />
+                                              {getSpeakerLabel(speaker, data.speakerLabels.find(l => l.speakerId === speaker)?.label || null)}
+                                            </DropdownMenuItem>
+                                          ))}
+                                      </DropdownMenuContent>
+                                    </DropdownMenu>
+                                    <span className="text-xs text-muted-foreground">
+                                      {formatTimestamp(utterance.startMs)}
+                                    </span>
+                                    {segIndex === 0 && hasEdit && (
+                                      <Badge variant="outline" className="text-xs py-0 text-primary">
+                                        edited
+                                      </Badge>
+                                    )}
+                                  </div>
+                                  {/* Three-dot menu for segment actions */}
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                      <Button variant="ghost" size="sm" className="h-6 w-6 p-0">
+                                        <MoreVertical className="h-3 w-3" />
+                                      </Button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="end">
+                                      {segIndex === 0 && (
+                                        <DropdownMenuItem onClick={handleRevertUtterance}>
+                                          <Undo2 className="h-4 w-4 mr-2" />
+                                          Revert All Changes
+                                        </DropdownMenuItem>
+                                      )}
+                                      <DropdownMenuItem 
+                                        onClick={() => handleDeleteSegment(segIndex)}
+                                        className="text-destructive focus:text-destructive"
+                                      >
+                                        <Trash2 className="h-4 w-4 mr-2" />
+                                        Delete Segment
+                                      </DropdownMenuItem>
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
+                                </div>
+                                {/* Word-by-word tracking highlight */}
+                                <p className="text-sm leading-relaxed" data-text-content>
+                                  {words.map((word, wordIndex) => {
+                                    const wordStart = segmentCharCount;
+                                    const wordEnd = segmentCharCount + word.length;
+                                    segmentCharCount = wordEnd;
+                                    
+                                    const isCurrentWord = isActive && wordStart <= currentCharIndex && currentCharIndex < wordEnd;
+                                    const hasBeenSpoken = isActive && wordEnd <= currentCharIndex;
+                                    
+                                    if (word.trim() === '') {
+                                      return <span key={wordIndex}>{word}</span>;
+                                    }
+                                    
+                                    return (
+                                      <span
+                                        key={wordIndex}
+                                        className={`
+                                          transition-all duration-100
+                                          ${isCurrentWord ? 'bg-yellow-300 dark:bg-yellow-600 px-0.5 rounded font-medium' : ''}
+                                          ${hasBeenSpoken && !isCurrentWord ? 'text-foreground' : ''}
+                                          ${!hasBeenSpoken && !isCurrentWord && isActive ? 'text-muted-foreground' : ''}
+                                        `}
+                                      >
+                                        {word}
+                                      </span>
+                                    );
+                                  })}
+                                </p>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    }
+                    
+                    // Single segment (no edits or single speaker) - render as before
+                    const primarySpeaker = segments[0];
+                    const speakerDisplayLabel = getSpeakerLabel(primarySpeaker.speaker, primarySpeaker.speakerLabel);
+                    
+                    // Helper to delete entire utterance (mark as deleted)
+                    const handleDeleteUtterance = () => {
+                      setUtteranceEdits(prev => {
+                        // Add an edit with empty segments to mark as deleted
+                        const filtered = prev.filter(e => e.utteranceId !== utterance.id);
+                        return [...filtered, { utteranceId: utterance.id, segments: [] }];
+                      });
+                      toast.success('Block deleted');
+                    };
+
+                    // Helper to revert edits for this utterance
+                    const handleRevertUtterance = () => {
+                      setUtteranceEdits(prev => prev.filter(e => e.utteranceId !== utterance.id));
+                      toast.success('Edits reverted');
+                    };
+
+                    // Check if this utterance is marked as deleted
+                    const isDeleted = utteranceEdits.find(e => e.utteranceId === utterance.id)?.segments.length === 0;
+                    if (isDeleted) {
+                      return (
+                        <div
+                          key={utterance.id}
+                          id={`utterance-${utterance.id}`}
+                          className="p-3 rounded-lg bg-muted/30 border border-dashed border-muted-foreground/30"
                         >
-                          <User className="h-3 w-3 mr-1" />
-                          {speakerLabel}
-                        </Badge>
-                        <SpeakerLabelDialog
-                          speaker={utterance.speaker}
-                          currentLabel={speakerLabel}
-                          recordingId={id}
-                          onUpdate={() => refetch()}
-                        />
-                        <span className="text-xs text-muted-foreground">
-                          {formatTimestamp(utterance.startMs)}
-                        </span>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-muted-foreground italic">
+                              Block deleted
+                            </span>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={handleRevertUtterance}
+                              className="h-6 text-xs"
+                            >
+                              <Undo2 className="h-3 w-3 mr-1" />
+                              Restore
+                            </Button>
+                          </div>
+                        </div>
+                      );
+                    }
+                    
+                    return (
+                      <div
+                        key={utterance.id}
+                        id={`utterance-${utterance.id}`}
+                        ref={isActive ? activeUtteranceRef : null}
+                        className={`
+                          p-3 rounded-lg cursor-pointer transition-all select-text
+                          ${isActive 
+                            ? 'bg-primary/10 border-l-4 border-primary shadow-sm' 
+                            : 'hover:bg-muted/50'
+                          }
+                          ${hasEdit ? 'ring-2 ring-primary/30' : ''}
+                        `}
+                        onClick={(e) => {
+                          const selection = window.getSelection();
+                          if (!selection || selection.isCollapsed) {
+                            seekTo(utterance.startMs);
+                          }
+                        }}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <div className="flex items-center gap-2">
+                            <Badge 
+                              variant="secondary" 
+                              className={speakerColorMap[primarySpeaker.speaker]}
+                            >
+                              <User className="h-3 w-3 mr-1" />
+                              {speakerDisplayLabel}
+                            </Badge>
+                            <SpeakerLabelDialog
+                              speaker={primarySpeaker.speaker}
+                              currentLabel={speakerDisplayLabel}
+                              recordingId={id}
+                              onUpdate={() => refetch()}
+                            />
+                            <ChangeSegmentSpeakerDialog
+                              utterance={utterance}
+                              existingSpeakers={allSpeakers}
+                              speakerLabels={data.speakerLabels}
+                              onChangeSpeaker={(newSpeaker, newLabel) => 
+                                handleEntireSegmentSpeakerChange(utterance.id, newSpeaker, newLabel)
+                              }
+                              getSpeakerLabel={getSpeakerLabel}
+                              speakerColorMap={speakerColorMap}
+                            />
+                            <span className="text-xs text-muted-foreground">
+                              {formatTimestamp(utterance.startMs)}
+                            </span>
+                            {hasEdit && (
+                              <Badge variant="outline" className="text-xs py-0 text-primary">
+                                edited
+                              </Badge>
+                            )}
+                          </div>
+                          {/* Three-dot menu for block actions */}
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" size="sm" className="h-6 w-6 p-0">
+                                <MoreVertical className="h-3 w-3" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              {hasEdit && (
+                                <DropdownMenuItem onClick={handleRevertUtterance}>
+                                  <Undo2 className="h-4 w-4 mr-2" />
+                                  Revert Changes
+                                </DropdownMenuItem>
+                              )}
+                              <DropdownMenuItem 
+                                onClick={handleDeleteUtterance}
+                                className="text-destructive focus:text-destructive"
+                              >
+                                <Trash2 className="h-4 w-4 mr-2" />
+                                Delete Block
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+                        <p className="text-sm leading-relaxed" data-text-content>
+                          <SegmentedText
+                            segments={segments}
+                            utteranceStartMs={utterance.startMs}
+                            utteranceEndMs={utterance.endMs}
+                            currentTimeMs={currentTimeMs}
+                            isActive={isActive}
+                            searchHighlights={searchHighlights}
+                            speakerColorMap={speakerColorMap}
+                            getSpeakerLabel={getSpeakerLabel}
+                          />
+                        </p>
                       </div>
-                      <p className="text-sm leading-relaxed">
-                        <WordHighlightedText
-                          text={utterance.text}
-                          utteranceStartMs={utterance.startMs}
-                          utteranceEndMs={utterance.endMs}
-                          currentTimeMs={currentTimeMs}
-                          isActive={isActive}
-                          searchHighlights={searchHighlights}
-                        />
-                      </p>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </ScrollArea>
         </CardContent>
       </Card>
+
+      {/* Text Selection Popover */}
+      {textSelection && (
+        <SelectionPopover
+          selection={textSelection}
+          existingSpeakers={allSpeakers}
+          speakerLabels={data.speakerLabels}
+          onChangeSpeaker={(newSpeaker, newLabel) => {
+            handlePartialSpeakerChange(
+              textSelection.utteranceId,
+              textSelection.startOffset,
+              textSelection.endOffset,
+              newSpeaker,
+              newLabel
+            );
+          }}
+          onClose={() => {
+            setTextSelection(null);
+            window.getSelection()?.removeAllRanges();
+          }}
+          getSpeakerLabel={getSpeakerLabel}
+          speakerColorMap={speakerColorMap}
+          currentSpeaker={getSelectedUtteranceSpeaker()}
+        />
+      )}
+
+      {/* Floating Playback Bar */}
+      <FloatingPlaybackBar
+        isPlaying={isPlaying}
+        currentTimeMs={currentTimeMs}
+        durationMs={audioDurationMs}
+        onTogglePlayPause={togglePlayPause}
+        onSkip={skip}
+        onSeek={seekTo}
+        hasAudio={!!recording.convertedAudioUrl}
+      />
     </div>
   );
 }

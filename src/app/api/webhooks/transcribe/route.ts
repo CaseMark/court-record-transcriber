@@ -35,7 +35,7 @@ export async function POST(request: NextRequest) {
     }
 
     if (status === 'completed') {
-      const now = new Date().toISOString();
+      const now = new Date();
 
       // Create transcript record with summary and confidence
       const transcriptId = uuidv4();
@@ -83,12 +83,35 @@ export async function POST(request: NextRequest) {
         }
       }
 
+      // Calculate duration from audio_duration or from utterances
+      let durationInSeconds: number | null = null;
+      
+      // Try audio_duration first - it could be in seconds or milliseconds
+      if (audio_duration) {
+        // If value is > 10000, it's likely in milliseconds
+        if (audio_duration > 10000) {
+          durationInSeconds = Math.round(audio_duration / 1000);
+        } else {
+          // Otherwise assume it's already in seconds
+          durationInSeconds = Math.round(audio_duration);
+        }
+      }
+      
+      // Fallback: calculate from last utterance end time
+      if (!durationInSeconds && transcriptUtterances && transcriptUtterances.length > 0) {
+        const lastUtterance = transcriptUtterances[transcriptUtterances.length - 1];
+        // Utterance end times are in milliseconds
+        durationInSeconds = Math.round(lastUtterance.end / 1000);
+      }
+
       // Update recording status
       await db
         .update(recordings)
         .set({
           status: 'completed',
-          durationSeconds: audio_duration ? Math.round(audio_duration / 1000) : recording.durationSeconds,
+          durationSeconds: (durationInSeconds && durationInSeconds > 0) 
+            ? durationInSeconds 
+            : recording.durationSeconds,
           updatedAt: now,
         })
         .where(eq(recordings.id, recording.id));
@@ -100,7 +123,7 @@ export async function POST(request: NextRequest) {
         .set({
           status: 'failed',
           errorMessage: error || 'Transcription failed',
-          updatedAt: new Date().toISOString(),
+          updatedAt: new Date(),
         })
         .where(eq(recordings.id, recording.id));
     }

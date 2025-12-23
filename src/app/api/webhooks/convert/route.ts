@@ -37,7 +37,7 @@ export async function POST(request: NextRequest) {
           .set({
             status: 'failed',
             errorMessage: 'Conversion completed but no output URL provided',
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
           .where(eq(recordings.id, recording.id));
 
@@ -52,7 +52,7 @@ export async function POST(request: NextRequest) {
           durationSeconds: metadata?.duration_seconds,
           channelCount: metadata?.channels,
           status: 'transcribing',
-          updatedAt: new Date().toISOString(),
+          updatedAt: new Date(),
         })
         .where(eq(recordings.id, recording.id));
 
@@ -68,7 +68,7 @@ export async function POST(request: NextRequest) {
           .update(recordings)
           .set({
             transcriptionJobId: transcriptionJob.id,
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
           .where(eq(recordings.id, recording.id));
 
@@ -81,7 +81,7 @@ export async function POST(request: NextRequest) {
           .set({
             status: 'failed',
             errorMessage: `Transcription failed to start: ${transcribeError instanceof Error ? transcribeError.message : 'Unknown error'}`,
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
           .where(eq(recordings.id, recording.id));
       }
@@ -91,7 +91,7 @@ export async function POST(request: NextRequest) {
         .set({
           status: 'failed',
           errorMessage: error || 'Conversion failed',
-          updatedAt: new Date().toISOString(),
+          updatedAt: new Date(),
         })
         .where(eq(recordings.id, recording.id));
     }

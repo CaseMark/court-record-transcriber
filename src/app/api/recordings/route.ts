@@ -100,7 +100,7 @@ export async function POST(request: NextRequest) {
 
     // Create recording record in database
     const recordingId = uuidv4();
-    const now = new Date().toISOString();
+    const now = new Date();
 
     const [newRecording] = await db.insert(recordings).values({
       id: recordingId,
@@ -124,8 +124,9 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error('Error creating recording:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json(
-      { error: 'Failed to create recording' },
+      { error: `Failed to create recording: ${errorMessage}` },
       { status: 500 }
     );
   }

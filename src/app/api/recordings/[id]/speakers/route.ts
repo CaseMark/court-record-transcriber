@@ -93,7 +93,7 @@ export async function PUT(
       );
     }
 
-    const now = new Date().toISOString();
+    const now = new Date();
 
     // Update or create speaker labels
     for (const { speakerId, label } of speakers) {

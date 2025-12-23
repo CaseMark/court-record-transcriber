@@ -51,7 +51,7 @@ export async function DELETE(
         status: 'uploading', // Reset to initial state
         transcriptionJobId: null,
         errorMessage: null,
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(),
       })
       .where(eq(recordings.id, id));
 

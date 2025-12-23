@@ -65,7 +65,8 @@ export default function UploadPage() {
       });
 
       if (!createResponse.ok) {
-        throw new Error('Failed to create recording');
+        const errorData = await createResponse.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to create recording');
       }
 
       const { recording, uploadUrl } = await createResponse.json();

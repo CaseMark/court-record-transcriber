@@ -152,7 +152,7 @@ export async function PATCH(
     }
 
     const updateData: Partial<typeof recordings.$inferInsert> = {
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(),
     };
 
     if (caseNumber !== undefined) updateData.caseNumber = caseNumber;

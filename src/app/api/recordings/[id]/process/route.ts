@@ -60,7 +60,7 @@ export async function POST(
           .set({
             convertJobId: convertJob.id,
             status: 'converting',
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
           .where(eq(recordings.id, id));
 
@@ -79,7 +79,7 @@ export async function POST(
           .set({
             status: 'failed',
             errorMessage: `Conversion failed: ${convertError instanceof Error ? convertError.message : 'Unknown error'}`,
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
           .where(eq(recordings.id, id));
 
@@ -109,7 +109,7 @@ export async function POST(
             transcriptionJobId: transcriptionJob.id,
             convertedAudioUrl: objectInfo.downloadUrl,
             status: 'transcribing',
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
           .where(eq(recordings.id, id));
 
@@ -127,7 +127,7 @@ export async function POST(
           .set({
             status: 'failed',
             errorMessage: `Transcription failed: ${transcribeError instanceof Error ? transcribeError.message : 'Unknown error'}`,
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
           .where(eq(recordings.id, id));
 
@@ -201,7 +201,7 @@ export async function GET(
         if (transcriptionJob.status === 'completed' && recording.status === 'transcribing') {
           console.log('Syncing completed transcription results for recording:', recording.id);
           
-          const now = new Date().toISOString();
+          const now = new Date();
 
           // Check if transcript already exists
           const existingTranscript = await db.query.transcripts.findFirst({
@@ -249,12 +249,34 @@ export async function GET(
           }
 
           // Update recording status
+          // Calculate duration from audio_duration or from utterances
+          let durationInSeconds: number | null = null;
+          
+          // Try audio_duration first - it could be in seconds or milliseconds
+          if (transcriptionJob.audio_duration) {
+            // If value is > 10000, it's likely in milliseconds
+            if (transcriptionJob.audio_duration > 10000) {
+              durationInSeconds = Math.round(transcriptionJob.audio_duration / 1000);
+            } else {
+              // Otherwise assume it's already in seconds
+              durationInSeconds = Math.round(transcriptionJob.audio_duration);
+            }
+          }
+          
+          // Fallback: calculate from last utterance end time
+          if (!durationInSeconds && transcriptionJob.utterances && transcriptionJob.utterances.length > 0) {
+            const lastUtterance = transcriptionJob.utterances[transcriptionJob.utterances.length - 1];
+            // Utterance end times are in milliseconds
+            durationInSeconds = Math.round(lastUtterance.end / 1000);
+          }
+          
           await db
             .update(recordings)
             .set({
               status: 'completed',
-              durationSeconds: transcriptionJob.audio_duration 
-                ? Math.round(transcriptionJob.audio_duration / 1000) 
+              // Only update duration if we got a valid value > 0
+              durationSeconds: (durationInSeconds && durationInSeconds > 0) 
+                ? durationInSeconds 
                 : recording.durationSeconds,
               updatedAt: now,
             })
