@@ -2,7 +2,7 @@
 
 import { useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { useDropzone } from 'react-dropzone';
+import { useDropzone, FileRejection } from 'react-dropzone';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -14,6 +14,10 @@ const ACCEPTED_FORMATS = {
   'audio/*': ['.ftr', '.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac'],
   'video/*': ['.mp4', '.webm', '.mov'],
 };
+
+// Maximum file size: 500MB (industry standard for audio/video uploads)
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
+const MAX_FILE_SIZE_MB = 500;
 
 type UploadStatus = 'idle' | 'uploading' | 'processing' | 'complete' | 'error';
 
@@ -37,10 +41,32 @@ export default function UploadPage() {
     }
   }, []);
 
+  const onDropRejected = useCallback((fileRejections: FileRejection[]) => {
+    const rejection = fileRejections[0];
+    if (rejection) {
+      const error = rejection.errors[0];
+      if (error?.code === 'file-too-large') {
+        toast.error('File too large', {
+          description: `Maximum file size is ${MAX_FILE_SIZE_MB}MB. Your file is ${(rejection.file.size / (1024 * 1024)).toFixed(1)}MB.`,
+        });
+      } else if (error?.code === 'file-invalid-type') {
+        toast.error('Invalid file type', {
+          description: 'Please upload a supported audio or video file (FTR, MP3, WAV, M4A, FLAC, MP4, WebM).',
+        });
+      } else {
+        toast.error('File rejected', {
+          description: error?.message || 'Please try a different file.',
+        });
+      }
+    }
+  }, []);
+
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
+    onDropRejected,
     accept: ACCEPTED_FORMATS,
     maxFiles: 1,
+    maxSize: MAX_FILE_SIZE,
     multiple: false,
   });
 

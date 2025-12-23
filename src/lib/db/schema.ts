@@ -1,4 +1,4 @@
-import { pgTable, text, integer, real, timestamp } from 'drizzle-orm/pg-core';
+import { pgTable, text, integer, real, timestamp, index } from 'drizzle-orm/pg-core';
 
 // Recordings table - tracks uploaded court recordings
 export const recordings = pgTable('recordings', {
@@ -31,7 +31,11 @@ export const recordings = pgTable('recordings', {
   
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index('recordings_status_idx').on(table.status),
+  index('recordings_case_number_idx').on(table.caseNumber),
+  index('recordings_created_at_idx').on(table.createdAt),
+]);
 
 // Transcripts table - stores transcription results
 export const transcripts = pgTable('transcripts', {
@@ -47,7 +51,9 @@ export const transcripts = pgTable('transcripts', {
   chaptersJson: text('chapters_json'), // JSON string of chapters
   
   createdAt: timestamp('created_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index('transcripts_recording_id_idx').on(table.recordingId),
+]);
 
 // Utterances table - individual speaker segments with timestamps
 export const utterances = pgTable('utterances', {
@@ -64,7 +70,12 @@ export const utterances = pgTable('utterances', {
   
   // For search indexing and ordering
   sequenceIndex: integer('sequence_index').notNull(),
-});
+}, (table) => [
+  index('utterances_recording_id_idx').on(table.recordingId),
+  index('utterances_transcript_id_idx').on(table.transcriptId),
+  index('utterances_speaker_idx').on(table.speaker),
+  index('utterances_sequence_idx').on(table.recordingId, table.sequenceIndex),
+]);
 
 // Speaker labels - user-defined speaker names per recording
 export const speakerLabels = pgTable('speaker_labels', {
@@ -73,7 +84,9 @@ export const speakerLabels = pgTable('speaker_labels', {
   speakerId: text('speaker_id').notNull(), // 'A', 'B', etc.
   label: text('label').notNull(), // 'Judge Smith', 'Defense Attorney', etc.
   createdAt: timestamp('created_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index('speaker_labels_recording_id_idx').on(table.recordingId),
+]);
 
 // Search history - for quick access to recent searches
 export const searchHistory = pgTable('search_history', {
@@ -82,7 +95,10 @@ export const searchHistory = pgTable('search_history', {
   query: text('query').notNull(),
   resultCount: integer('result_count'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index('search_history_recording_id_idx').on(table.recordingId),
+  index('search_history_created_at_idx').on(table.createdAt),
+]);
 
 // Types for TypeScript
 export type Recording = typeof recordings.$inferSelect;

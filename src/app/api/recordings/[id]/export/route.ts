@@ -4,8 +4,7 @@ import { eq } from 'drizzle-orm';
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Header, Footer, PageNumber } from 'docx';
 import { jsPDF } from 'jspdf';
 
-// Case.dev brand color
-const CASEDEV_ORANGE = '#E65100';
+// Case.dev brand color (RGB for jsPDF)
 const CASEDEV_ORANGE_RGB = { r: 230, g: 81, b: 0 };
 
 /**
@@ -97,8 +96,14 @@ export async function GET(
   } catch (error) {
     console.error('Error exporting transcript:', error);
     console.error('Error details:', error instanceof Error ? error.stack : String(error));
+    
+    // Only expose error details in development
+    const isDev = process.env.NODE_ENV === 'development';
     return NextResponse.json(
-      { error: 'Failed to export transcript', details: error instanceof Error ? error.message : String(error) },
+      { 
+        error: 'Failed to export transcript', 
+        ...(isDev && { details: error instanceof Error ? error.message : String(error) })
+      },
       { status: 500 }
     );
   }

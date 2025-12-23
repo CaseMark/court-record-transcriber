@@ -3,9 +3,27 @@ import { db, recordings } from '@/lib/db';
 import { casedev } from '@/lib/casedev';
 import { v4 as uuidv4 } from 'uuid';
 import { desc } from 'drizzle-orm';
+import { z } from 'zod';
 
 // App vault ID - in production, this would be stored in env or created on first use
 const APP_VAULT_NAME = 'Court Recording Transcriber';
+
+// Maximum file size: 500MB (industry standard for audio files)
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
+
+// Input validation schema
+const createRecordingSchema = z.object({
+  filename: z.string().min(1, 'Filename is required').max(255, 'Filename too long'),
+  fileSizeBytes: z.number()
+    .positive('File size must be positive')
+    .max(MAX_FILE_SIZE, `File size exceeds maximum of ${MAX_FILE_SIZE / (1024 * 1024)}MB`),
+  caseNumber: z.string().max(100, 'Case number too long').optional().nullable(),
+  courtName: z.string().max(255, 'Court name too long').optional().nullable(),
+  recordingDate: z.string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Invalid date format (use YYYY-MM-DD)')
+    .optional()
+    .nullable(),
+});
 
 /**
  * GET /api/recordings
@@ -34,14 +52,18 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { filename, fileSizeBytes, caseNumber, courtName, recordingDate } = body;
-
-    if (!filename || !fileSizeBytes) {
+    
+    // Validate input
+    const validationResult = createRecordingSchema.safeParse(body);
+    if (!validationResult.success) {
+      const errors = validationResult.error.issues.map((e: z.ZodIssue) => e.message).join(', ');
       return NextResponse.json(
-        { error: 'filename and fileSizeBytes are required' },
+        { error: `Validation failed: ${errors}` },
         { status: 400 }
       );
     }
+    
+    const { filename, fileSizeBytes, caseNumber, courtName, recordingDate } = validationResult.data;
 
     // Get file extension to determine format
     const extension = filename.split('.').pop()?.toLowerCase() || '';
