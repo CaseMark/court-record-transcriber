@@ -630,20 +630,433 @@ function SegmentedText({
   );
 }
 
-// PDF Preview Dialog
-function PDFExportDialog({ 
+// Constants for document preview pagination
+const LINES_PER_PAGE = 25; // Standard legal transcript has ~25 lines per page
+const CHARS_PER_LINE = 65; // Approximate characters that fit on a line
+
+// Helper to split text into lines for proper line numbering
+function splitTextIntoLines(text: string, charsPerLine: number = CHARS_PER_LINE): string[] {
+  const words = text.split(' ');
+  const lines: string[] = [];
+  let currentLine = '';
+  
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    if (testLine.length <= charsPerLine) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+  
+  return lines;
+}
+
+// Process segments into lines with proper numbering
+interface DocumentLine {
+  lineNumber: number;
+  type: 'header' | 'metadata' | 'content' | 'separator' | 'footer';
+  speaker?: string;
+  speakerLabel?: string | null;
+  timestamp?: string;
+  text: string;
+  isContinuation?: boolean;
+}
+
+function processSegmentsIntoLines(
+  segments: Array<{
+    speaker: string;
+    speakerLabel: string | null;
+    text: string;
+    startMs: number;
+  }>,
+  getSpeakerLabel: (speaker: string, label: string | null) => string
+): DocumentLine[] {
+  const lines: DocumentLine[] = [];
+  let lineNumber = 1;
+  
+  for (const segment of segments) {
+    const speaker = getSpeakerLabel(segment.speaker, segment.speakerLabel);
+    const timestamp = formatTimestamp(segment.startMs);
+    const prefix = `[${timestamp}] ${speaker.toUpperCase()}: `;
+    const prefixLength = prefix.length;
+    
+    // Split the text into lines, accounting for the prefix on the first line
+    const firstLineChars = CHARS_PER_LINE - prefixLength;
+    const textLines = splitTextIntoLines(segment.text, CHARS_PER_LINE);
+    
+    // Re-split considering prefix
+    const allLines: string[] = [];
+    let remainingText = segment.text;
+    
+    // First line has less space due to prefix
+    const firstWords: string[] = [];
+    let firstLineLength = 0;
+    const words = remainingText.split(' ');
+    let wordIndex = 0;
+    
+    while (wordIndex < words.length) {
+      const word = words[wordIndex];
+      const testLength = firstLineLength + (firstLineLength > 0 ? 1 : 0) + word.length;
+      if (testLength <= Math.max(firstLineChars, 30)) {
+        firstWords.push(word);
+        firstLineLength = testLength;
+        wordIndex++;
+      } else {
+        break;
+      }
+    }
+    
+    allLines.push(firstWords.join(' '));
+    remainingText = words.slice(wordIndex).join(' ');
+    
+    // Remaining lines have full width
+    if (remainingText) {
+      const remainingLines = splitTextIntoLines(remainingText, CHARS_PER_LINE);
+      allLines.push(...remainingLines);
+    }
+    
+    // Create document lines
+    allLines.forEach((lineText, idx) => {
+      lines.push({
+        lineNumber: lineNumber++,
+        type: 'content',
+        speaker: idx === 0 ? segment.speaker : undefined,
+        speakerLabel: idx === 0 ? segment.speakerLabel : undefined,
+        timestamp: idx === 0 ? timestamp : undefined,
+        text: lineText,
+        isContinuation: idx > 0,
+      });
+    });
+  }
+  
+  return lines;
+}
+
+// Paginate lines into pages
+interface DocumentPage {
+  pageNumber: number;
+  lines: DocumentLine[];
+}
+
+function paginateLines(lines: DocumentLine[], linesPerPage: number = LINES_PER_PAGE): DocumentPage[] {
+  const pages: DocumentPage[] = [];
+  let currentPage: DocumentLine[] = [];
+  let pageNumber = 1;
+  
+  for (const line of lines) {
+    currentPage.push(line);
+    if (currentPage.length >= linesPerPage) {
+      pages.push({ pageNumber: pageNumber++, lines: currentPage });
+      currentPage = [];
+    }
+  }
+  
+  if (currentPage.length > 0) {
+    pages.push({ pageNumber: pageNumber, lines: currentPage });
+  }
+  
+  return pages;
+}
+
+// Shared Document Preview Component
+function DocumentPreview({
+  recording,
+  segments,
+  getSpeakerLabel,
+  title,
+  subtitle,
+  format,
+}: {
+  recording: Recording;
+  segments: Array<{
+    speaker: string;
+    speakerLabel: string | null;
+    text: string;
+    startMs: number;
+    endMs: number;
+  }>;
+  getSpeakerLabel: (speaker: string, label: string | null) => string;
+  title: string;
+  subtitle: string;
+  format: 'pdf' | 'docx' | 'txt';
+}) {
+  // Process all segments into lines with proper line numbering
+  const documentLines = useMemo(() => {
+    return processSegmentsIntoLines(segments, getSpeakerLabel);
+  }, [segments, getSpeakerLabel]);
+  
+  // Paginate the lines
+  const pages = useMemo(() => {
+    return paginateLines(documentLines);
+  }, [documentLines]);
+  
+  const totalPages = pages.length;
+  
+  if (format === 'txt') {
+    // Plain text preview
+    return (
+      <div className="font-mono text-xs bg-gray-900 text-gray-100 rounded-lg overflow-hidden">
+        <ScrollArea className="h-[55vh]">
+          <div className="p-4 space-y-0">
+            {/* Header */}
+            <div className="text-amber-400 mb-2">◆ Transcription generated through case.dev</div>
+            <div className="text-gray-500 mb-4">{'═'.repeat(72)}</div>
+            
+            {/* Title */}
+            <div className="text-center mb-2">
+              <div className="text-white font-bold">{title}</div>
+              <div className="text-gray-400">{subtitle}</div>
+            </div>
+            <div className="text-gray-500 mb-4">{'═'.repeat(72)}</div>
+            
+            {/* Metadata */}
+            <div className="mb-4">
+              <div className="text-white font-bold mb-1">RECORDING INFORMATION</div>
+              <div className="text-gray-500 mb-2">{'─'.repeat(30)}</div>
+              <div className="text-gray-300">  File:          {recording.filename}</div>
+              {recording.caseNumber && <div className="text-gray-300">  Case Number:   {recording.caseNumber}</div>}
+              {recording.courtName && <div className="text-gray-300">  Court:         {recording.courtName}</div>}
+              {recording.recordingDate && <div className="text-gray-300">  Date:          {recording.recordingDate}</div>}
+              {recording.durationSeconds && <div className="text-gray-300">  Duration:      {formatDuration(recording.durationSeconds)}</div>}
+            </div>
+            
+            <div className="text-gray-500 mb-4">{'─'.repeat(72)}</div>
+            <div className="text-white font-bold mb-2">TRANSCRIPT OF PROCEEDINGS</div>
+            <div className="text-gray-500 mb-4">{'─'.repeat(30)}</div>
+            
+            {/* Content with pages */}
+            {pages.map((page, pageIdx) => (
+              <div key={page.pageNumber} className="relative">
+                {pageIdx > 0 && (
+                  <div className="border-t-2 border-dashed border-gray-600 my-6 relative">
+                    <span className="absolute left-1/2 -translate-x-1/2 -top-3 bg-gray-900 px-3 text-gray-500 text-xs">
+                      Page {page.pageNumber} of {totalPages}
+                    </span>
+                  </div>
+                )}
+                {page.lines.map((line) => (
+                  <div key={line.lineNumber} className="flex">
+                    <span className="text-gray-600 w-8 text-right mr-3 select-none">
+                      {line.lineNumber.toString().padStart(3, ' ')}
+                    </span>
+                    <span className="flex-1">
+                      {line.timestamp && (
+                        <span className="text-gray-500">[{line.timestamp}] </span>
+                      )}
+                      {line.speaker && (
+                        <span className="text-cyan-400">
+                          {getSpeakerLabel(line.speaker, line.speakerLabel).toUpperCase()}:{' '}
+                        </span>
+                      )}
+                      <span className="text-gray-200">{line.text}</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ))}
+            
+            {/* Footer */}
+            <div className="text-gray-500 mt-6">{'─'.repeat(72)}</div>
+            <div className="text-center text-gray-400 mt-2">END OF TRANSCRIPT</div>
+            <div className="text-gray-500 mt-4">{'─'.repeat(72)}</div>
+            <div className="text-center text-gray-500 mt-2 italic text-[10px]">
+              This transcript was generated using automated speech recognition technology.
+            </div>
+          </div>
+        </ScrollArea>
+      </div>
+    );
+  }
+  
+  // PDF/DOCX preview (visual document format)
+  return (
+    <div className="bg-gray-200 rounded-lg overflow-hidden">
+      <ScrollArea className="h-[55vh]">
+        <div className="p-6 space-y-6">
+          {pages.map((page, pageIdx) => (
+            <div 
+              key={page.pageNumber}
+              className="bg-white shadow-lg mx-auto relative"
+              style={{ 
+                fontFamily: 'Helvetica, Arial, sans-serif',
+                width: '8.5in',
+                minHeight: '11in',
+                padding: '0.75in',
+                boxSizing: 'border-box',
+              }}
+            >
+              {/* Page header */}
+              <div className="flex items-center justify-between mb-4 pb-2" style={{ borderBottom: '1px solid #ccc' }}>
+                <span style={{ color: '#E65100', fontSize: 9 }}>
+                  ◆ Transcription generated through case.dev
+                </span>
+                <span style={{ color: '#666', fontSize: 9 }}>
+                  Page {page.pageNumber} of {totalPages}
+                </span>
+              </div>
+              
+              {/* First page header content */}
+              {pageIdx === 0 && (
+                <>
+                  {/* Title Section */}
+                  <div className="text-center mb-6">
+                    <h1 style={{ fontSize: 18, fontWeight: 'bold', marginBottom: 4, color: '#000' }}>
+                      {title || 'OFFICIAL TRANSCRIPT'}
+                    </h1>
+                    <p style={{ fontSize: 13, color: '#333' }}>
+                      {subtitle || 'Court Recording Transcription'}
+                    </p>
+                  </div>
+
+                  {/* Double line separator */}
+                  <div className="mb-4">
+                    <div style={{ borderTop: '2px solid #000', marginBottom: 2 }} />
+                    <div style={{ borderTop: '1px solid #000' }} />
+                  </div>
+
+                  {/* Recording Information */}
+                  <div className="mb-4">
+                    <h2 style={{ fontSize: 11, fontWeight: 'bold', marginBottom: 8, color: '#000' }}>
+                      RECORDING INFORMATION
+                    </h2>
+                    <div style={{ fontSize: 10 }}>
+                      <div className="flex gap-2 mb-1">
+                        <span style={{ fontWeight: 'bold', width: 90, color: '#000' }}>File:</span>
+                        <span style={{ color: '#333' }}>{recording.filename}</span>
+                      </div>
+                      {recording.caseNumber && (
+                        <div className="flex gap-2 mb-1">
+                          <span style={{ fontWeight: 'bold', width: 90, color: '#000' }}>Case Number:</span>
+                          <span style={{ color: '#333' }}>{recording.caseNumber}</span>
+                        </div>
+                      )}
+                      {recording.courtName && (
+                        <div className="flex gap-2 mb-1">
+                          <span style={{ fontWeight: 'bold', width: 90, color: '#000' }}>Court:</span>
+                          <span style={{ color: '#333' }}>{recording.courtName}</span>
+                        </div>
+                      )}
+                      {recording.recordingDate && (
+                        <div className="flex gap-2 mb-1">
+                          <span style={{ fontWeight: 'bold', width: 90, color: '#000' }}>Date:</span>
+                          <span style={{ color: '#333' }}>{recording.recordingDate}</span>
+                        </div>
+                      )}
+                      {recording.durationSeconds && (
+                        <div className="flex gap-2 mb-1">
+                          <span style={{ fontWeight: 'bold', width: 90, color: '#000' }}>Duration:</span>
+                          <span style={{ color: '#333' }}>{formatDuration(recording.durationSeconds)}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Separator */}
+                  <div style={{ borderTop: '1px solid #ccc', marginBottom: 16 }} />
+
+                  {/* Transcript heading */}
+                  <h2 style={{ fontSize: 12, fontWeight: 'bold', marginBottom: 12, color: '#000' }}>
+                    TRANSCRIPT OF PROCEEDINGS
+                  </h2>
+                </>
+              )}
+              
+              {/* Continuation header for subsequent pages */}
+              {pageIdx > 0 && (
+                <div className="mb-4">
+                  <h2 style={{ fontSize: 10, color: '#666', fontStyle: 'italic' }}>
+                    TRANSCRIPT OF PROCEEDINGS (continued)
+                  </h2>
+                </div>
+              )}
+              
+              {/* Lines with line numbers */}
+              <div style={{ fontSize: 10 }}>
+                {page.lines.map((line) => (
+                  <div key={line.lineNumber} className="flex mb-0.5" style={{ minHeight: '1.4em' }}>
+                    <span style={{ 
+                      color: '#888', 
+                      width: 30, 
+                      flexShrink: 0, 
+                      fontFamily: 'monospace', 
+                      fontSize: 9,
+                      textAlign: 'right',
+                      paddingRight: 8,
+                    }}>
+                      {line.lineNumber}
+                    </span>
+                    <div className="flex-1" style={{ color: '#000' }}>
+                      {line.timestamp && (
+                        <span style={{ color: '#666' }}>[{line.timestamp}] </span>
+                      )}
+                      {line.speaker && (
+                        <span style={{ fontWeight: 'bold' }}>
+                          {getSpeakerLabel(line.speaker, line.speakerLabel).toUpperCase()}:{' '}
+                        </span>
+                      )}
+                      {line.isContinuation && !line.speaker && (
+                        <span style={{ paddingLeft: 8 }}></span>
+                      )}
+                      <span>{line.text}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              
+              {/* Last page footer */}
+              {pageIdx === pages.length - 1 && (
+                <div className="mt-8">
+                  <div style={{ borderTop: '1px solid #000', marginBottom: 8 }} />
+                  <p className="text-center" style={{ fontSize: 11, fontWeight: 'bold', color: '#000' }}>
+                    END OF TRANSCRIPT
+                  </p>
+                  <div className="mt-6 text-center" style={{ fontSize: 9, color: '#666', fontStyle: 'italic' }}>
+                    <p>This transcript was generated using automated speech recognition technology.</p>
+                    <p>Document generated on {new Date().toLocaleDateString()} at {new Date().toLocaleTimeString()}</p>
+                  </div>
+                </div>
+              )}
+              
+              {/* Page footer */}
+              <div 
+                className="absolute bottom-6 left-0 right-0 text-center"
+                style={{ fontSize: 9, color: '#666' }}
+              >
+                Page {page.pageNumber} of {totalPages}
+              </div>
+            </div>
+          ))}
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+// Generic Export Dialog Component
+function ExportDialog({ 
   recording, 
   utterances,
   utteranceEdits,
   getSpeakerLabel,
+  format,
+  formatLabel,
+  formatIcon: FormatIcon,
 }: { 
   recording: Recording;
   utterances: Utterance[];
   utteranceEdits: UtteranceEdit[];
   getSpeakerLabel: (speaker: string, label: string | null) => string;
+  format: 'pdf' | 'docx' | 'txt';
+  formatLabel: string;
+  formatIcon: React.ElementType;
 }) {
   const [open, setOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [title, setTitle] = useState('OFFICIAL TRANSCRIPT');
+  const [subtitle, setSubtitle] = useState('Court Recording Transcription');
 
   // Process utterances with edits and merge adjacent same-speaker segments
   const processedSegments = useMemo(() => {
@@ -699,121 +1112,124 @@ function PDFExportDialog({
     return merged;
   }, [utterances, utteranceEdits]);
 
-  const generatePDFContent = () => {
-    const width = 60;
-    let content = '';
-    
-    // Case.dev watermark header
-    content += `◆ Transcription generated through case.dev\n\n`;
-    content += `${'═'.repeat(width)}\n\n`;
-    
-    // Title
-    const title = 'OFFICIAL TRANSCRIPT';
-    const subtitle = 'Court Recording Transcription';
-    content += `${' '.repeat(Math.floor((width - title.length) / 2))}${title}\n`;
-    content += `${' '.repeat(Math.floor((width - subtitle.length) / 2))}${subtitle}\n\n`;
-    content += `${'═'.repeat(width)}\n`;
-    content += `${'─'.repeat(width)}\n\n`;
-    
-    // Recording Information
-    content += `RECORDING INFORMATION\n`;
-    content += `${'─'.repeat(30)}\n\n`;
-    content += `  File:          ${recording.filename}\n`;
-    if (recording.caseNumber) content += `  Case Number:   ${recording.caseNumber}\n`;
-    if (recording.courtName) content += `  Court:         ${recording.courtName}\n`;
-    if (recording.recordingDate) content += `  Date:          ${recording.recordingDate}\n`;
-    content += `  Duration:      ${formatDuration(recording.durationSeconds)}\n`;
-    content += `\n${'─'.repeat(width)}\n\n`;
-    
-    // Transcript heading
-    content += `TRANSCRIPT OF PROCEEDINGS\n`;
-    content += `${'─'.repeat(30)}\n\n`;
-
-    // Utterances with line numbers
-    let lineNumber = 1;
-    processedSegments.forEach((segment) => {
-      const speaker = getSpeakerLabel(segment.speaker, segment.speakerLabel);
-      const timestamp = formatTimestamp(segment.startMs);
-      const lineNum = lineNumber.toString().padStart(3, ' ');
-      content += `${lineNum}  [${timestamp}] ${speaker.toUpperCase()}:\n`;
-      content += `      ${segment.text}\n\n`;
-      lineNumber++;
-    });
-
-    // End of transcript
-    content += `${'─'.repeat(width)}\n\n`;
-    const endText = 'END OF TRANSCRIPT';
-    content += `${' '.repeat(Math.floor((width - endText.length) / 2))}${endText}\n\n`;
-    content += `${'─'.repeat(width)}\n\n`;
-    
-    // Footer
-    content += `This transcript was generated using automated speech recognition technology.\n`;
-    content += `Document generated on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}\n\n`;
-    content += `${'═'.repeat(width)}\n`;
-
-    return content;
-  };
-
   const editCount = utteranceEdits.length;
 
-  const handleExportPDF = async () => {
+  const handleExport = async () => {
     setIsExporting(true);
     try {
-      const response = await fetch(`/api/recordings/${recording.id}/export?format=pdf`);
+      const params = new URLSearchParams({
+        format: format,
+        title: title,
+        subtitle: subtitle,
+      });
+      const response = await fetch(`/api/recordings/${recording.id}/export?${params}`);
       if (!response.ok) throw new Error('Export failed');
       
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${recording.filename.replace(/\.[^/.]+$/, '')}_transcript.pdf`;
+      a.download = `${recording.filename.replace(/\.[^/.]+$/, '')}_transcript.${format}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       
-      toast.success('PDF exported successfully');
+      toast.success(`${formatLabel} exported successfully`);
       setOpen(false);
     } catch (error) {
-      toast.error('Failed to export PDF');
+      toast.error(`Failed to export ${formatLabel}`);
     } finally {
       setIsExporting(false);
     }
   };
 
+  // Calculate document stats
+  const documentLines = useMemo(() => {
+    return processSegmentsIntoLines(processedSegments, getSpeakerLabel);
+  }, [processedSegments, getSpeakerLabel]);
+  
+  const pages = useMemo(() => {
+    return paginateLines(documentLines);
+  }, [documentLines]);
+
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-          <FileDown className="h-4 w-4 mr-2" />
-          Export as PDF
+          <FormatIcon className="h-4 w-4 mr-2" />
+          Export as {formatLabel}
         </DropdownMenuItem>
       </DialogTrigger>
-      <DialogContent className="max-w-3xl max-h-[80vh]">
+      <DialogContent className="max-w-5xl max-h-[95vh] w-[95vw]">
         <DialogHeader>
-          <DialogTitle>PDF Export Preview</DialogTitle>
-          <DialogDescription>
-            Preview your transcript before exporting
+          <DialogTitle className="flex items-center gap-2">
+            <FormatIcon className="h-5 w-5" />
+            {formatLabel} Export Preview
+          </DialogTitle>
+          <DialogDescription className="flex items-center gap-4">
+            <span>Customize and preview your transcript before exporting</span>
+            <span className="text-muted-foreground">
+              {pages.length} page{pages.length !== 1 ? 's' : ''} • {documentLines.length} lines
+            </span>
             {editCount > 0 && (
-              <span className="ml-2 text-primary">
+              <span className="text-primary">
                 ({editCount} segment{editCount !== 1 ? 's' : ''} edited)
               </span>
             )}
           </DialogDescription>
         </DialogHeader>
-        <div className="border rounded-lg bg-white dark:bg-gray-900 p-6 max-h-[50vh] overflow-auto">
-          <pre className="whitespace-pre-wrap font-mono text-sm">
-            {generatePDFContent()}
-          </pre>
+        
+        {/* Editable Title and Subtitle */}
+        <div className="grid sm:grid-cols-2 gap-3">
+          <div className="grid gap-1.5">
+            <label htmlFor={`${format}-title`} className="text-sm font-medium">
+              Document Title
+            </label>
+            <Input
+              id={`${format}-title`}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Enter document title..."
+              className="font-medium"
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <label htmlFor={`${format}-subtitle`} className="text-sm font-medium">
+              Subtitle
+            </label>
+            <Input
+              id={`${format}-subtitle`}
+              value={subtitle}
+              onChange={(e) => setSubtitle(e.target.value)}
+              placeholder="Enter subtitle..."
+            />
+          </div>
         </div>
-        <DialogFooter>
+
+        {/* Document Preview */}
+        <DocumentPreview
+          recording={recording}
+          segments={processedSegments}
+          getSpeakerLabel={getSpeakerLabel}
+          title={title}
+          subtitle={subtitle}
+          format={format}
+        />
+
+        <DialogFooter className="gap-2 sm:gap-0">
+          <div className="flex-1 text-xs text-muted-foreground">
+            {format === 'pdf' && 'PDF format preserves formatting for printing'}
+            {format === 'docx' && 'Word format allows editing in Microsoft Word'}
+            {format === 'txt' && 'Plain text format for maximum compatibility'}
+          </div>
           <Button variant="outline" onClick={() => setOpen(false)}>
             <X className="h-4 w-4 mr-2" />
             Cancel
           </Button>
-          <Button onClick={handleExportPDF} disabled={isExporting}>
+          <Button onClick={handleExport} disabled={isExporting}>
             <FileDown className="h-4 w-4 mr-2" />
-            {isExporting ? 'Exporting...' : 'Download PDF'}
+            {isExporting ? 'Exporting...' : `Download ${formatLabel}`}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1170,27 +1586,6 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
     }
   };
 
-  const handleExport = async (format: 'docx' | 'txt') => {
-    try {
-      const response = await fetch(`/api/recordings/${id}/export?format=${format}`);
-      if (!response.ok) throw new Error('Export failed');
-      
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `transcript.${format}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      
-      toast.success(`Exported as ${format.toUpperCase()}`);
-    } catch (error) {
-      toast.error('Export failed');
-    }
-  };
-
   // Handle partial text speaker change (from selection)
   const handlePartialSpeakerChange = useCallback((
     utteranceId: string,
@@ -1484,20 +1879,33 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent>
-              <PDFExportDialog 
+              <ExportDialog 
                 recording={recording} 
                 utterances={utterances}
                 utteranceEdits={utteranceEdits}
                 getSpeakerLabel={getSpeakerLabel}
+                format="pdf"
+                formatLabel="PDF"
+                formatIcon={FileDown}
               />
-              <DropdownMenuItem onClick={() => handleExport('docx')}>
-                <FileText className="h-4 w-4 mr-2" />
-                Export as Word (.docx)
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleExport('txt')}>
-                <FileText className="h-4 w-4 mr-2" />
-                Export as Text (.txt)
-              </DropdownMenuItem>
+              <ExportDialog 
+                recording={recording} 
+                utterances={utterances}
+                utteranceEdits={utteranceEdits}
+                getSpeakerLabel={getSpeakerLabel}
+                format="docx"
+                formatLabel="Word (.docx)"
+                formatIcon={FileText}
+              />
+              <ExportDialog 
+                recording={recording} 
+                utterances={utterances}
+                utteranceEdits={utteranceEdits}
+                getSpeakerLabel={getSpeakerLabel}
+                format="txt"
+                formatLabel="Text (.txt)"
+                formatIcon={FileText}
+              />
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -1672,7 +2080,7 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
                   <p>No transcript available</p>
                 </div>
               ) : (
-                <div className="space-y-3">
+                <div className="space-y-6">
                   {displayUtterances.map((utterance) => {
                     const isActive = currentTimeMs >= utterance.startMs && currentTimeMs < utterance.endMs;
                     const segments = getUtteranceSegments(utterance);

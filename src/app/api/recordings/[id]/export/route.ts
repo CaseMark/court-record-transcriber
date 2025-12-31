@@ -4,9 +4,6 @@ import { eq } from 'drizzle-orm';
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Header, Footer, PageNumber } from 'docx';
 import { jsPDF } from 'jspdf';
 
-// Case.dev brand color (RGB for jsPDF)
-const CASEDEV_ORANGE_RGB = { r: 230, g: 81, b: 0 };
-
 /**
  * GET /api/recordings/[id]/export
  * Export transcript to Word document
@@ -19,6 +16,8 @@ export async function GET(
     const { id } = await params;
     const { searchParams } = new URL(request.url);
     const format = searchParams.get('format') || 'docx';
+    const customTitle = searchParams.get('title') || 'OFFICIAL TRANSCRIPT';
+    const customSubtitle = searchParams.get('subtitle') || 'Court Recording Transcription';
 
     // Get recording
     const recording = await db.query.recordings.findFirst({
@@ -61,7 +60,7 @@ export async function GET(
     });
 
     if (format === 'docx') {
-      const docBuffer = await generateWordDocument(recording, recordingUtterances, labelMap);
+      const docBuffer = await generateWordDocument(recording, recordingUtterances, labelMap, customTitle, customSubtitle);
       
       return new NextResponse(new Uint8Array(docBuffer), {
         headers: {
@@ -70,7 +69,7 @@ export async function GET(
         },
       });
     } else if (format === 'txt') {
-      const textContent = generatePlainText(recording, recordingUtterances, labelMap);
+      const textContent = generatePlainText(recording, recordingUtterances, labelMap, customTitle, customSubtitle);
       
       return new NextResponse(textContent, {
         headers: {
@@ -79,7 +78,7 @@ export async function GET(
         },
       });
     } else if (format === 'pdf') {
-      const pdfBuffer = await generatePDFDocument(recording, recordingUtterances, labelMap);
+      const pdfBuffer = await generatePDFDocument(recording, recordingUtterances, labelMap, customTitle, customSubtitle);
       
       return new NextResponse(new Uint8Array(pdfBuffer), {
         headers: {
@@ -112,7 +111,9 @@ export async function GET(
 async function generateWordDocument(
   recording: typeof recordings.$inferSelect,
   utteranceList: Array<typeof utterances.$inferSelect>,
-  labelMap: Record<string, string>
+  labelMap: Record<string, string>,
+  customTitle: string = 'OFFICIAL TRANSCRIPT',
+  customSubtitle: string = 'Court Recording Transcription'
 ): Promise<Buffer> {
   const children: Paragraph[] = [];
 
@@ -121,7 +122,7 @@ async function generateWordDocument(
     new Paragraph({
       children: [
         new TextRun({
-          text: 'OFFICIAL TRANSCRIPT',
+          text: customTitle,
           bold: true,
           size: 32,
           font: 'Helvetica',
@@ -137,7 +138,7 @@ async function generateWordDocument(
     new Paragraph({
       children: [
         new TextRun({
-          text: 'Court Recording Transcription',
+          text: customSubtitle,
           size: 24,
           color: '333333',
           font: 'Helvetica',
@@ -441,7 +442,9 @@ async function generateWordDocument(
 function generatePlainText(
   recording: typeof recordings.$inferSelect,
   utteranceList: Array<typeof utterances.$inferSelect>,
-  labelMap: Record<string, string>
+  labelMap: Record<string, string>,
+  customTitle: string = 'OFFICIAL TRANSCRIPT',
+  customSubtitle: string = 'Court Recording Transcription'
 ): string {
   const lines: string[] = [];
   const width = 72;
@@ -453,10 +456,8 @@ function generatePlainText(
   lines.push('');
 
   // Title
-  const title = 'OFFICIAL TRANSCRIPT';
-  const subtitle = 'Court Recording Transcription';
-  lines.push(' '.repeat(Math.floor((width - title.length) / 2)) + title);
-  lines.push(' '.repeat(Math.floor((width - subtitle.length) / 2)) + subtitle);
+  lines.push(' '.repeat(Math.max(0, Math.floor((width - customTitle.length) / 2))) + customTitle);
+  lines.push(' '.repeat(Math.max(0, Math.floor((width - customSubtitle.length) / 2))) + customSubtitle);
   lines.push('');
   lines.push('═'.repeat(width));
   lines.push('─'.repeat(width));
@@ -547,37 +548,9 @@ function sanitizeFilename(filename: string): string {
   return filename.replace(/[^a-zA-Z0-9.-]/g, '_').replace(/\.[^.]+$/, '');
 }
 
-// Helper function to draw the Case.dev logo on a jsPDF page
-function drawCaseDevLogo(doc: jsPDF, x: number, y: number, size: number = 12) {
-  // Draw briefcase body (orange rectangle with rounded corners)
-  doc.setDrawColor(CASEDEV_ORANGE_RGB.r, CASEDEV_ORANGE_RGB.g, CASEDEV_ORANGE_RGB.b);
-  doc.setLineWidth(0.5);
-  doc.roundedRect(x, y + 2, size, size * 0.7, 1, 1, 'S');
-  
-  // Draw handle
-  doc.roundedRect(x + size * 0.3, y, size * 0.4, 3, 0.5, 0.5, 'S');
-  
-  // Draw code brackets < >
-  doc.setLineWidth(0.4);
-  // Left bracket <
-  doc.line(x + 3, y + 4, x + 1.5, y + 6);
-  doc.line(x + 1.5, y + 6, x + 3, y + 8);
-  // Right bracket >
-  doc.line(x + size - 3, y + 4, x + size - 1.5, y + 6);
-  doc.line(x + size - 1.5, y + 6, x + size - 3, y + 8);
-}
-
-// Helper function to draw page header with Case.dev branding
+// Helper function to draw page header with page numbers
 function drawPageHeader(doc: jsPDF, pageNumber: number, totalPages: number) {
   const pageWidth = doc.internal.pageSize.getWidth();
-  
-  // Draw Case.dev logo
-  drawCaseDevLogo(doc, 15, 8, 12);
-  
-  // Draw watermark text
-  doc.setFontSize(8);
-  doc.setTextColor(CASEDEV_ORANGE_RGB.r, CASEDEV_ORANGE_RGB.g, CASEDEV_ORANGE_RGB.b);
-  doc.text('Transcription generated through case.dev', 30, 14);
   
   // Draw page number on the right
   doc.setFontSize(9);
@@ -591,7 +564,9 @@ function drawPageHeader(doc: jsPDF, pageNumber: number, totalPages: number) {
 async function generatePDFDocument(
   recording: typeof recordings.$inferSelect,
   utteranceList: Array<typeof utterances.$inferSelect>,
-  labelMap: Record<string, string>
+  labelMap: Record<string, string>,
+  customTitle: string = 'OFFICIAL TRANSCRIPT',
+  customSubtitle: string = 'Court Recording Transcription'
 ): Promise<Buffer> {
   // Create new PDF document (Letter size: 215.9mm x 279.4mm)
   const doc = new jsPDF({
@@ -612,13 +587,13 @@ async function generatePDFDocument(
   // Title - Professional legal document style
   doc.setFontSize(16);
   doc.setFont('helvetica', 'bold');
-  doc.text('OFFICIAL TRANSCRIPT', pageWidth / 2, y, { align: 'center' });
+  doc.text(customTitle, pageWidth / 2, y, { align: 'center' });
   y += 8;
   
   doc.setFontSize(12);
   doc.setFont('helvetica', 'normal');
   doc.setTextColor(51, 51, 51);
-  doc.text('Court Recording Transcription', pageWidth / 2, y, { align: 'center' });
+  doc.text(customSubtitle, pageWidth / 2, y, { align: 'center' });
   y += 12;
   
   // Double line separator (legal style)
@@ -694,8 +669,8 @@ async function generatePDFDocument(
   doc.text('TRANSCRIPT OF PROCEEDINGS', margin, y);
   y += 8;
 
-  // Utterances with professional formatting
-  doc.setFontSize(9);
+  // Utterances with professional formatting - number every line like legal transcripts
+  const lineHeight = 4; // mm per line
   let lineNumber = 1;
   
   for (const utterance of utteranceList) {
@@ -705,31 +680,39 @@ async function generatePDFDocument(
     // Build the text line
     const lineText = `[${timestamp}] ${speakerName.toUpperCase()}: ${utterance.text}`;
     
-    // Split text to fit within content width
-    const splitText = doc.splitTextToSize(lineText, contentWidth - 15);
-    const textHeight = splitText.length * 4;
-
-    // Check if we need a new page (leave room for footer)
-    if (y + textHeight > pageHeight - 30) {
-      doc.addPage();
-      pages.push(pages.length + 1);
-      y = 30;
-      lineNumber = 1;
-    }
-
-    // Line number in margin (legal transcript style)
-    doc.setFontSize(8);
-    doc.setTextColor(153, 153, 153);
-    doc.text(lineNumber.toString().padStart(3, ' '), margin - 8, y);
-    
-    // Main text
+    // Split text to fit within content width (accounting for line number margin)
     doc.setFontSize(9);
-    doc.setTextColor(0, 0, 0);
     doc.setFont('helvetica', 'normal');
-    doc.text(splitText, margin, y);
+    const splitText: string[] = doc.splitTextToSize(lineText, contentWidth - 12);
+
+    // Draw each wrapped line with its own line number
+    for (let i = 0; i < splitText.length; i++) {
+      // Check if we need a new page (leave room for footer)
+      if (y + lineHeight > pageHeight - 30) {
+        doc.addPage();
+        pages.push(pages.length + 1);
+        y = 30;
+        lineNumber = 1;
+      }
+
+      // Line number in margin - consistent size, font, color (not bold)
+      doc.setFontSize(8);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(128, 128, 128);
+      doc.text(lineNumber.toString().padStart(3, ' '), margin - 10, y);
+      
+      // Main text
+      doc.setFontSize(9);
+      doc.setTextColor(0, 0, 0);
+      doc.setFont('helvetica', 'normal');
+      doc.text(splitText[i], margin, y);
+      
+      y += lineHeight;
+      lineNumber++;
+    }
     
-    y += textHeight + 3;
-    lineNumber++;
+    // Add small gap between utterances
+    y += 1;
   }
 
   // End of transcript marker
